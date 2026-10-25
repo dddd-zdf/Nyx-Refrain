@@ -1235,7 +1235,8 @@ fn activate_window(window: &winit::window::Window) {
         }
         let ours = GetCurrentThreadId();
         let theirs = GetWindowThreadProcessId(foreground, None);
-        let attached = theirs != 0 && theirs != ours && AttachThreadInput(ours, theirs, true).as_bool();
+        let attached =
+            theirs != 0 && theirs != ours && AttachThreadInput(ours, theirs, true).as_bool();
         let _ = BringWindowToTop(hwnd);
         let _ = SetForegroundWindow(hwnd);
         let _ = SetFocus(hwnd);
