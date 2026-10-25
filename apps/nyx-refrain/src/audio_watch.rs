@@ -1,6 +1,7 @@
 //! Optional audio health log, for tracing crackles to a cause. Set `NYX_AUDIO_STATS=1` to
-//! write `%TEMP%\nyx-refrain-audio.log` (`/tmp` on Linux): a line for every second in which
-//! something could be heard (marked `!`), and a heartbeat every 10 s otherwise.
+//! write `%TEMP%\nyx-refrain-audio.log` (`/tmp` on Linux): one line per second, marked `!`
+//! when something could be heard. Every second is written so that a crackle the counters
+//! don't explain can still be matched against that second's numbers.
 
 use std::fs::File;
 use std::io::Write;
@@ -11,8 +12,8 @@ use pipeline::{GlitchCounts, PipelineMetricsTracker};
 use raop::ap2::session::Ap2Stats;
 
 /// A send this late (ms) past its schedule is worth flagging.
-const LATE_FLAG_MS: f64 = 10.0;
-const HEARTBEAT: Duration = Duration::from_secs(10);
+/// On the Low profile a delay well under 10 ms may already be audible.
+const LATE_FLAG_MS: f64 = 5.0;
 
 const LEGEND: &str = "\
 # starved  sender had no audio ready and sent silence (feeder too slow)
@@ -22,12 +23,15 @@ const LEGEND: &str = "\
 # wasapi   Windows flagged a break in the captured audio
 # overflow captured frames dropped because the capture buffer was full
 # resend   packets the speaker asked for again (network loss)
-# late     largest delay past a packet's scheduled send time
+# late     largest delay past a packet's scheduled send time (flagged from 5 ms)
 # Where a clump of audio comes from (largest per line):
 # win_burst  frames Windows handed over in one capture wake-up (480 = one 10 ms packet)
 # win_gap    time between capture wake-ups (about 10 ms is normal)
 # feed_gap   time between feeder reads that got audio (about 10 ms is normal)
-# ring_peak  packets queued when the sender took one (above 8 means a trim)";
+# ring_peak  packets queued when the sender took one (above 8 means a trim)
+# Drift steering:
+# nudge    speed correction applied right now (ppm; 500 = 0.05%)
+# learned  steady clock difference it has learned (ppm)";
 
 #[derive(Clone, Copy, Default)]
 struct Counts {
@@ -64,7 +68,6 @@ pub struct AudioWatch {
     file: Option<File>,
     last: Option<Counts>,
     window_start: Instant,
-    last_line: Instant,
 }
 
 impl AudioWatch {
@@ -80,7 +83,6 @@ impl AudioWatch {
             file,
             last: None,
             window_start: Instant::now(),
-            last_line: Instant::now(),
         }
     }
 
@@ -119,10 +121,6 @@ impl AudioWatch {
             ("resend", d(now.resend, last.resend)),
         ];
         let event = fields.iter().any(|&(_, n)| n > 0) || late_ms >= LATE_FLAG_MS;
-        if !event && self.last_line.elapsed() < HEARTBEAT {
-            return;
-        }
-        self.last_line = Instant::now();
         let mut line = format!("{} {}", clock(), if event { '!' } else { ' ' });
         for (name, n) in fields {
             line += &format!(" {name}={n}");
@@ -132,9 +130,11 @@ impl AudioWatch {
             win_gap_us as f64 / 1000.0,
             feed_gap.as_secs_f64() * 1000.0,
         );
+        let snap = metrics.snapshot();
         line += &format!(
-            " late={late_ms:.1}ms fill={fill} drift={:+.1}ppm sent={}",
-            metrics.snapshot().estimated_drift_ppm,
+            " late={late_ms:.1}ms fill={fill} nudge={:+.0}ppm learned={:+.1}ppm sent={}",
+            snap.applied_correction_ppm,
+            snap.estimated_drift_ppm,
             d(now.sent, last.sent)
         );
         let _ = writeln!(file, "{line}");
