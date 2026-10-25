@@ -1485,10 +1485,8 @@ impl Shell {
                     && *ppp == output.pixels_per_point
                     && *sz == [size.width, size.height] =>
             {
-                changed_area(shapes, &output.shapes).map_or(full, |area| {
-                    let area = (area * *ppp).expand(2.0);
-                    egui::Rect::from_min_max(area.min.floor(), area.max.ceil()).intersect(full)
-                })
+                let area = (changed_area(shapes, &output.shapes) * *ppp).expand(2.0);
+                egui::Rect::from_min_max(area.min.floor(), area.max.ceil()).intersect(full)
             }
             _ => full,
         };
@@ -1572,24 +1570,39 @@ impl Shell {
     }
 }
 
-/// Area (in points) where `next` differs from `prev`, or `None` when the frames can't be
-/// compared shape by shape (a shape was added or removed). Negative when nothing changed.
+/// Area (in points) where `next` differs from `prev`; negative when nothing changed.
+///
+/// Shapes the two frames share at the start and end are skipped, so a tooltip or row that
+/// appears or disappears costs only its own area. What is left is compared shape by shape
+/// when both sides have the same count, and taken whole otherwise.
 fn changed_area(
     prev: &[egui::epaint::ClippedShape],
     next: &[egui::epaint::ClippedShape],
-) -> Option<egui::Rect> {
-    if prev.len() != next.len() {
-        return None;
-    }
+) -> egui::Rect {
+    let prefix = prev.iter().zip(next).take_while(|(a, b)| a == b).count();
+    let suffix = prev[prefix..]
+        .iter()
+        .rev()
+        .zip(next[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let prev = &prev[prefix..prev.len() - suffix];
+    let next = &next[prefix..next.len() - suffix];
+    let bounds =
+        |s: &egui::epaint::ClippedShape| s.shape.visual_bounding_rect().intersect(s.clip_rect);
     let mut area = egui::Rect::NOTHING;
-    for (a, b) in prev.iter().zip(next) {
-        if a != b {
-            for s in [a, b] {
-                area = area.union(s.shape.visual_bounding_rect().intersect(s.clip_rect));
+    if prev.len() == next.len() {
+        for (a, b) in prev.iter().zip(next) {
+            if a != b {
+                area = area.union(bounds(a)).union(bounds(b));
             }
         }
+    } else {
+        for s in prev.iter().chain(next) {
+            area = area.union(bounds(s));
+        }
     }
-    Some(area)
+    area
 }
 
 impl winit::application::ApplicationHandler<Repaint> for Shell {
@@ -1700,6 +1713,35 @@ pub fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    fn rect(x: f32) -> egui::epaint::ClippedShape {
+        egui::epaint::ClippedShape {
+            clip_rect: egui::Rect::EVERYTHING,
+            shape: egui::epaint::Shape::rect_filled(
+                egui::Rect::from_min_max(egui::pos2(x, 0.0), egui::pos2(x + 1.0, 1.0)),
+                0.0,
+                egui::Color32::RED,
+            ),
+        }
+    }
+
+    fn x_span(r: egui::Rect) -> (f32, f32) {
+        (r.min.x, r.max.x)
+    }
+
+    #[test]
+    fn changed_area_covers_only_what_changed() {
+        let base = [rect(0.0), rect(10.0), rect(20.0)];
+        assert!(changed_area(&base, &base).is_negative());
+        // Same count: only the shape that changed.
+        let moved = [rect(0.0), rect(12.0), rect(20.0)];
+        assert_eq!(x_span(changed_area(&base, &moved)), (10.0, 13.0));
+        // A shape inserted in the middle (a tooltip): only its own area.
+        let inserted = [rect(0.0), rect(10.0), rect(30.0), rect(20.0)];
+        assert_eq!(x_span(changed_area(&base, &inserted)), (30.0, 31.0));
+        // And removed again.
+        assert_eq!(x_span(changed_area(&inserted, &base)), (30.0, 31.0));
+    }
+
     use super::*;
 
     #[test]
