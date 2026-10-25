@@ -96,55 +96,75 @@ fn wait_until_linux(target: Instant) {
     }
 }
 
+/// A waitable timer owned by one thread, closed when the thread exits.
+#[cfg(windows)]
+struct ThreadTimer(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl ThreadTimer {
+    fn create() -> Option<Self> {
+        use windows::Win32::System::Threading::{
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, TIMER_ALL_ACCESS,
+        };
+        unsafe {
+            // Try high-resolution waitable timer (Windows 10 1803+)
+            let timer = CreateWaitableTimerExW(
+                None,
+                None,
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS.0,
+            )
+            // Fall back to standard timer if high resolution flag is rejected
+            .or_else(|_| CreateWaitableTimerExW(None, None, 0, TIMER_ALL_ACCESS.0))
+            .ok()?;
+            (!timer.is_invalid()).then_some(Self(timer))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ThreadTimer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+thread_local! {
+    // Created on first use: the sender waits once per packet (~125/s), and creating and
+    // closing a kernel timer each time was needless work on the audio thread.
+    static THREAD_TIMER: Option<ThreadTimer> = ThreadTimer::create();
+}
+
 #[cfg(windows)]
 fn wait_until_windows(target: Instant) -> bool {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{
-        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, SetWaitableTimer,
-        TIMER_ALL_ACCESS, WaitForSingleObject,
-    };
+    use windows::Win32::System::Threading::{SetWaitableTimer, WaitForSingleObject};
 
-    let now = Instant::now();
-    if target <= now {
-        return true;
-    }
-    let dur = target.duration_since(now);
-
-    // Negative 100-nanosecond units for relative time in SetWaitableTimer
-    let nanos_100 = (dur.as_nanos() / 100) as i64;
-    let due_time = -nanos_100;
-
-    unsafe {
-        // Try high-resolution waitable timer (Windows 10 1803+)
-        let timer = match CreateWaitableTimerExW(
-            None,
-            None,
-            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-            TIMER_ALL_ACCESS.0,
-        ) {
-            Ok(h) => h,
-            Err(_) => {
-                // Fall back to standard timer if high resolution flag is rejected
-                match CreateWaitableTimerExW(None, None, 0, TIMER_ALL_ACCESS.0) {
-                    Ok(h) => h,
-                    Err(_) => return false,
-                }
-            }
-        };
-
-        if timer.is_invalid() {
+    THREAD_TIMER.with(|timer| {
+        let Some(timer) = timer else {
             return false;
+        };
+        let now = Instant::now();
+        if target <= now {
+            return true;
         }
+        let dur = target.duration_since(now);
 
-        let res = SetWaitableTimer(timer, &due_time, 0, None, None, false);
-        if res.is_ok() {
-            let timeout_ms = (dur.as_millis() as u32).saturating_add(50);
-            let _ = WaitForSingleObject(timer, timeout_ms);
+        // Negative 100-nanosecond units for relative time in SetWaitableTimer
+        let nanos_100 = (dur.as_nanos() / 100) as i64;
+        let due_time = -nanos_100;
+
+        unsafe {
+            let res = SetWaitableTimer(timer.0, &due_time, 0, None, None, false);
+            if res.is_ok() {
+                let timeout_ms = (dur.as_millis() as u32).saturating_add(50);
+                let _ = WaitForSingleObject(timer.0, timeout_ms);
+            }
         }
-
-        let _ = CloseHandle(timer);
         true
-    }
+    })
 }
 
 #[cfg(target_os = "linux")]
