@@ -42,22 +42,39 @@ impl Renderer {
         }
     }
 
+    /// Redraws the pixels inside `region` (whole pixels, in physical coordinates); the rest
+    /// of `buffer` keeps the previous frame.
     pub fn paint(
         &self,
         primitives: &[ClippedPrimitive],
         pixels_per_point: f32,
         size: [usize; 2],
         background: Color32,
+        region: Rect,
         buffer: &mut [u32],
     ) {
-        buffer.fill(pack(background.to_array().map(f32::from)));
+        let region = region.intersect(Rect::from_min_size(
+            Pos2::ZERO,
+            Vec2::new(size[0] as f32, size[1] as f32),
+        ));
+        if region.is_negative() {
+            return;
+        }
+        let background = pack(background.to_array().map(f32::from));
+        let (x0, x1) = (region.min.x as usize, region.max.x as usize);
+        for y in region.min.y as usize..region.max.y as usize {
+            buffer[y * size[0] + x0..y * size[0] + x1].fill(background);
+        }
         for clipped in primitives {
             // This UI uses only meshes; GPU paint callbacks have no CPU equivalent.
             let Primitive::Mesh(mesh) = &clipped.primitive else {
                 continue;
             };
+            let clip = (clipped.clip_rect * pixels_per_point).intersect(region);
+            if clip.is_negative() {
+                continue;
+            }
             let texture = &self.textures[&mesh.texture_id];
-            let clip = clipped.clip_rect * pixels_per_point;
             for indices in mesh.indices.chunks_exact(3) {
                 let vertices = [
                     mesh.vertices[indices[0] as usize],
@@ -209,7 +226,14 @@ mod tests {
             Rect::from_min_max(Pos2::ZERO, egui::pos2(4.0 / 3.0, 2.0)),
         );
         let mut buffer = [0; 16];
-        renderer.paint(&[primitive], 1.5, [4, 4], Color32::BLUE, &mut buffer);
+        renderer.paint(
+            &[primitive],
+            1.5,
+            [4, 4],
+            Color32::BLUE,
+            Rect::EVERYTHING,
+            &mut buffer,
+        );
         assert_eq!(
             buffer,
             [
@@ -217,6 +241,46 @@ mod tests {
                 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
             ]
         );
+    }
+
+    #[test]
+    fn region_repaint_matches_full_repaint_and_keeps_the_rest() {
+        let mut renderer = Renderer::default();
+        let mut delta = TexturesDelta {
+            set: [(
+                TextureId::default(),
+                [ImageDelta::full(
+                    ColorImage::filled([1, 1], Color32::WHITE),
+                    egui::TextureOptions::LINEAR,
+                )]
+                .into_iter()
+                .collect(),
+            )]
+            .into_iter()
+            .collect(),
+            free: Default::default(),
+        };
+        renderer.update_textures(&mut delta);
+        let scene = |color| [rectangle(color, Rect::EVERYTHING)];
+        let region = Rect::from_min_max(egui::pos2(1.0, 1.0), egui::pos2(3.0, 4.0));
+        let paint = |color, region, buffer: &mut [u32; 25]| {
+            renderer.paint(&scene(color), 2.0, [5, 5], Color32::BLUE, region, buffer);
+        };
+
+        let mut before = [0; 25];
+        paint(Color32::RED, Rect::EVERYTHING, &mut before);
+        let mut partial = before;
+        paint(Color32::GREEN, region, &mut partial);
+        let mut full = [0; 25];
+        paint(Color32::GREEN, Rect::EVERYTHING, &mut full);
+
+        for y in 0..5 {
+            for x in 0..5 {
+                let inside = (1..3).contains(&x) && (1..4).contains(&y);
+                let expected = if inside { full } else { before };
+                assert_eq!(partial[y * 5 + x], expected[y * 5 + x], "pixel ({x}, {y})");
+            }
+        }
     }
 
     #[test]
