@@ -1277,10 +1277,15 @@ struct WindowState {
     painted: Option<(Vec<egui::epaint::ClippedShape>, f32, [u32; 2])>,
 }
 
+/// Shortest time between scheduled egui passes (~60 per second).
+const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
 struct Shell {
     ctx: egui::Context,
     state: Option<WindowState>,
     next_repaint: Option<Instant>,
+    /// Start of the last egui pass, for [`MIN_FRAME_INTERVAL`].
+    last_pass: Option<Instant>,
     autostart: bool,
     error: Option<anyhow::Error>,
 }
@@ -1353,6 +1358,7 @@ impl Shell {
             return Ok(());
         };
         self.next_repaint = None;
+        self.last_pass = Some(Instant::now());
         let mut input = state.input.take_egui_input(&state.window);
         let info = input.viewports.entry(egui::ViewportId::ROOT).or_default();
         egui_winit::update_viewport_info(info, &self.ctx, &state.window, false);
@@ -1563,9 +1569,16 @@ impl winit::application::ApplicationHandler<Repaint> for Shell {
         event_loop: &winit::event_loop::ActiveEventLoop,
         _cause: winit::event::StartCause,
     ) {
-        if self.next_repaint.is_some_and(|at| at <= Instant::now())
-            && let Err(e) = self.frame(event_loop, false)
+        let now = Instant::now();
+        if !self.next_repaint.is_some_and(|at| at <= now) {
+            return;
+        }
+        // At most ~60 passes a second: moving the pointer otherwise asks for one per event.
+        if let Some(earliest) = self.last_pass.map(|at| at + MIN_FRAME_INTERVAL)
+            && earliest > now
         {
+            self.next_repaint = Some(earliest);
+        } else if let Err(e) = self.frame(event_loop, false) {
             self.fail(event_loop, e);
         }
     }
@@ -1598,6 +1611,7 @@ pub fn run() -> anyhow::Result<()> {
         ctx,
         state: None,
         next_repaint: None,
+        last_pass: None,
         autostart,
         error: None,
     };
