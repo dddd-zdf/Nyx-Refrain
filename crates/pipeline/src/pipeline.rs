@@ -245,6 +245,7 @@ pub fn start_pipeline_feeder(
                 let mut idle = false;
                 match source.read_chunk(read_frames) {
                     Ok(Some(chunk)) => {
+                        metrics.record_feeder_gap(last_activity.elapsed());
                         last_activity = Instant::now();
                         packets_batch.clear();
                         let current_fill = producer.slots(); // capacity - slots = fill

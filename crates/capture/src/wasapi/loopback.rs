@@ -398,6 +398,7 @@ fn run_capture_loop(
         NotificationRegistration::register(enumerator, device_change_flag.clone()).ok()
     });
 
+    let mut wake = super::WakeDiag::default();
     let mut sample_buf = Vec::<f32>::with_capacity(4096);
 
     while !stop_signal.load(Ordering::Relaxed) {
@@ -439,6 +440,7 @@ fn run_capture_loop(
                 // Timeout or failure; continue
                 continue;
             }
+            wake.woke();
 
             // Process all pending packets
             while let Ok(packet_size) = unsafe { session.capture_client.GetNextPacketSize() } {
@@ -464,6 +466,7 @@ fn run_capture_loop(
                 if hr.is_err() {
                     break;
                 }
+                wake.frames(num_frames);
 
                 // Discontinuity accounting
                 let mut mapped_flags = 0u32;
@@ -519,6 +522,7 @@ fn run_capture_loop(
                     let _ = session.capture_client.ReleaseBuffer(num_frames);
                 }
             }
+            wake.done();
         }
 
         // Clean up current session before loop iteration / rebuild

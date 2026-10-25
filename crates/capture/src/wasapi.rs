@@ -27,6 +27,42 @@ pub static DIAG_WASAPI_GLITCHES: std::sync::atomic::AtomicU64 =
 pub static DIAG_CAPTURE_OVERFLOW_FRAMES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Largest number of frames one capture wake-up drained since last reset: a big value means
+/// Windows delivered a clump of audio at once.
+pub static DIAG_CAPTURE_BURST_MAX_FRAMES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Longest time (µs) between two capture wake-ups that had audio, since last reset.
+pub static DIAG_CAPTURE_WAKE_GAP_MAX_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Feeds [`DIAG_CAPTURE_BURST_MAX_FRAMES`] and [`DIAG_CAPTURE_WAKE_GAP_MAX_US`] from a capture
+/// thread.
+#[derive(Default)]
+pub(crate) struct WakeDiag {
+    last: Option<std::time::Instant>,
+    frames: u64,
+}
+
+impl WakeDiag {
+    pub(crate) fn woke(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last {
+            DIAG_CAPTURE_WAKE_GAP_MAX_US.fetch_max((now - last).as_micros() as u64, Relaxed);
+        }
+        self.last = Some(now);
+        self.frames = 0;
+    }
+
+    pub(crate) fn frames(&mut self, n: u32) {
+        self.frames += n as u64;
+    }
+
+    pub(crate) fn done(&self) {
+        DIAG_CAPTURE_BURST_MAX_FRAMES.fetch_max(self.frames, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Writes as many whole frames of `samples` as fit into the capture ring in one block and
 /// returns the number of samples dropped. Per-sample pushes could split a frame when the ring
 /// filled, shifting every later frame by one channel.

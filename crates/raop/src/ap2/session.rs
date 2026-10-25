@@ -1057,6 +1057,7 @@ impl Ap2Session {
         let rt_metrics = metrics.clone();
         let live = source_is_live;
         let started = Self::start(cfg, move |pcm: &mut [i16; SAMPLES_PER_PACKET]| {
+            rt_metrics.record_ring_peak(consumer.slots());
             if live {
                 // Keep latency bounded: drop backlog beyond a few packets (see
                 // AudioSource::is_live). No allocation, no locks.

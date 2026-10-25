@@ -22,7 +22,12 @@ const LEGEND: &str = "\
 # wasapi   Windows flagged a break in the captured audio
 # overflow captured frames dropped because the capture buffer was full
 # resend   packets the speaker asked for again (network loss)
-# late     largest delay past a packet's scheduled send time";
+# late     largest delay past a packet's scheduled send time
+# Where a clump of audio comes from (largest per line):
+# win_burst  frames Windows handed over in one capture wake-up (480 = one 10 ms packet)
+# win_gap    time between capture wake-ups (about 10 ms is normal)
+# feed_gap   time between feeder reads that got audio (about 10 ms is normal)
+# ring_peak  packets queued when the sender took one (above 6 means a trim)";
 
 #[derive(Clone, Copy, Default)]
 struct Counts {
@@ -87,7 +92,16 @@ impl AudioWatch {
         }
         self.window_start = Instant::now();
         let now = Counts::read(metrics, stats);
+        // Peaks cover this second only, whether or not it gets a line.
         let late_ms = stats.send_late_max_us.swap(0, Ordering::Relaxed) as f64 / 1000.0;
+        let (feed_gap, ring_peak) = metrics.take_burst_peaks();
+        #[cfg(windows)]
+        let (win_burst, win_gap_us) = (
+            capture::wasapi::DIAG_CAPTURE_BURST_MAX_FRAMES.swap(0, Ordering::Relaxed),
+            capture::wasapi::DIAG_CAPTURE_WAKE_GAP_MAX_US.swap(0, Ordering::Relaxed),
+        );
+        #[cfg(not(windows))]
+        let (win_burst, win_gap_us) = (0, 0);
         // A new session starts its counters from zero.
         let Some(last) = self.last.replace(now).filter(|l| l.sent <= now.sent) else {
             let _ = writeln!(file, "{} session started", clock());
@@ -113,6 +127,11 @@ impl AudioWatch {
         for (name, n) in fields {
             line += &format!(" {name}={n}");
         }
+        line += &format!(
+            " win_burst={win_burst} win_gap={:.1}ms feed_gap={:.1}ms ring_peak={ring_peak}",
+            win_gap_us as f64 / 1000.0,
+            feed_gap.as_secs_f64() * 1000.0,
+        );
         line += &format!(
             " late={late_ms:.1}ms fill={fill} drift={:+.1}ppm sent={}",
             metrics.snapshot().estimated_drift_ppm,

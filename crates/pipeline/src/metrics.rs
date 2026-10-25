@@ -52,6 +52,8 @@ pub struct PipelineMetricsTracker {
     packets_dropped: AtomicU64,
     capture_discontinuities: AtomicU64,
     glitches: [AtomicU64; 3],
+    feeder_gap_max_us: AtomicU64,
+    ring_peak: AtomicU64,
 }
 
 /// Which audible gap a [`PipelineMetricsTracker::record_glitch`] call reports.
@@ -85,6 +87,8 @@ impl PipelineMetricsTracker {
             packets_dropped: AtomicU64::new(0),
             capture_discontinuities: AtomicU64::new(0),
             glitches: Default::default(),
+            feeder_gap_max_us: AtomicU64::new(0),
+            ring_peak: AtomicU64::new(0),
         }
     }
 
@@ -127,6 +131,27 @@ impl PipelineMetricsTracker {
     pub fn record_glitch(&self, glitch: Glitch) {
         self.record_discontinuity();
         self.glitches[glitch as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record the time since the feeder's previous read that returned audio.
+    #[inline]
+    pub fn record_feeder_gap(&self, gap: std::time::Duration) {
+        self.feeder_gap_max_us
+            .fetch_max(gap.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// Record the ring fill (packets) the sender found before taking a packet.
+    #[inline]
+    pub fn record_ring_peak(&self, packets: usize) {
+        self.ring_peak.fetch_max(packets as u64, Ordering::Relaxed);
+    }
+
+    /// Longest feeder gap and highest ring fill since the previous call, then resets both.
+    pub fn take_burst_peaks(&self) -> (std::time::Duration, usize) {
+        (
+            std::time::Duration::from_micros(self.feeder_gap_max_us.swap(0, Ordering::Relaxed)),
+            self.ring_peak.swap(0, Ordering::Relaxed) as usize,
+        )
     }
 
     /// Totals per glitch cause since the tracker was created.
