@@ -81,6 +81,7 @@ pub struct WasapiLoopbackSource {
     rebuild_sm: Arc<Mutex<RebuildStateMachine>>,
     drift_mapper: Arc<Mutex<QpcTimestampMapper>>,
     last_read_instant: Instant,
+    data_signal: Arc<crate::DataSignal>,
     stop_signal: Arc<AtomicBool>,
     thread_handle: Option<JoinHandle<()>>,
     is_started: bool,
@@ -134,6 +135,7 @@ impl WasapiLoopbackSource {
             format_info.sample_rate,
         )));
         let stop_signal = Arc::new(AtomicBool::new(false));
+        let data_signal = Arc::new(crate::DataSignal::default());
 
         // Spawn capture thread
         let thread_stop = stop_signal.clone();
@@ -142,6 +144,7 @@ impl WasapiLoopbackSource {
         let thread_discontinuity = discontinuity_tracker.clone();
         let thread_rebuild = rebuild_sm.clone();
         let thread_drift = drift_mapper.clone();
+        let thread_data = data_signal.clone();
 
         let thread_handle = std::thread::Builder::new()
             .name("wasapi-loopback-capture".into())
@@ -153,6 +156,7 @@ impl WasapiLoopbackSource {
                     thread_discontinuity,
                     thread_rebuild,
                     thread_drift,
+                    thread_data,
                     thread_stop,
                 );
             })?;
@@ -166,6 +170,7 @@ impl WasapiLoopbackSource {
             rebuild_sm,
             drift_mapper,
             last_read_instant: Instant::now(),
+            data_signal,
             stop_signal,
             thread_handle: Some(thread_handle),
             is_started: false,
@@ -227,6 +232,10 @@ impl AudioSource for WasapiLoopbackSource {
         true
     }
 
+    fn data_signal(&self) -> Option<Arc<crate::DataSignal>> {
+        Some(self.data_signal.clone())
+    }
+
     fn sample_rate(&self) -> u32 {
         self.format_info.sample_rate
     }
@@ -277,13 +286,8 @@ impl AudioSource for WasapiLoopbackSource {
         let max_samples = max_frames * channels;
         let mut samples = Vec::with_capacity(max_samples);
 
-        // Drain available samples from lock-free SPSC consumer
-        while samples.len() < max_samples {
-            match self.consumer.pop() {
-                Ok(sample) => samples.push(sample),
-                Err(rtrb::PopError::Empty) => break,
-            }
-        }
+        // Drain available whole frames from lock-free SPSC consumer
+        super::pop_frames(&mut self.consumer, max_samples, channels, &mut samples);
 
         if samples.is_empty() {
             // No captured data right now (WASAPI delivers every ~10 ms). Report "nothing yet"
@@ -367,6 +371,7 @@ pub(crate) unsafe fn parse_format_from_pwfx(
 }
 
 /// Real-time capture loop running on dedicated OS thread with MMCSS "Pro Audio" priority.
+#[allow(clippy::too_many_arguments)]
 fn run_capture_loop(
     device_spec: DeviceSpec,
     enable_silence_keepalive: bool,
@@ -374,6 +379,7 @@ fn run_capture_loop(
     discontinuity_tracker: Arc<DiscontinuityTracker>,
     rebuild_sm: Arc<Mutex<RebuildStateMachine>>,
     drift_mapper: Arc<Mutex<QpcTimestampMapper>>,
+    data_signal: Arc<crate::DataSignal>,
     stop_signal: Arc<AtomicBool>,
 ) {
     let _com = match ComMtaGuard::new() {
@@ -489,13 +495,15 @@ fn run_capture_loop(
                         )
                         .is_ok()
                     {
-                        // Push into lock-free rtrb buffer (Zero heap alloc, zero locks, zero logs in RT loop!)
-                        for &sample in &sample_buf {
-                            if producer.push(sample).is_err() {
-                                // Ring buffer full; count as dropped frame without blocking
-                                discontinuity_tracker.record_packet(FLAG_DATA_DISCONTINUITY, 1);
-                            }
+                        // Push into lock-free rtrb buffer (zero heap alloc, zero locks)
+                        let channels = session.format_info.channels as usize;
+                        let dropped = super::push_frames(&mut producer, &sample_buf, channels);
+                        if dropped > 0 {
+                            // Ring buffer full; count once per block without blocking
+                            discontinuity_tracker
+                                .record_packet(FLAG_DATA_DISCONTINUITY, dropped / channels.max(1));
                         }
+                        data_signal.notify();
                     }
                 }
 

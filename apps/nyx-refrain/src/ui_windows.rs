@@ -2,10 +2,12 @@
 #![cfg(windows)]
 
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::engine::{self, Cmd, DeviceEntry, Engine, Firewall, StartParams, State};
+use crate::frame_stats::{FrameStats, Stage};
 use crate::i18n::{
     Key, Lang, engine_error_detail, engine_error_title, format_firewall_error,
     format_stats_columns, format_stats_detail, t,
@@ -855,6 +857,8 @@ fn configure_styles(ctx: &egui::Context) {
         .into();
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(8.0, 4.0);
+        // Hover fades cost several full CPU-rendered frames each; change state instantly.
+        style.animation_time = 0.0;
     });
 }
 
@@ -1323,14 +1327,22 @@ struct WindowState {
     renderer: crate::soft_render::Renderer,
     app: App,
     close_requested: bool,
+    /// Shapes, scale and size of the last presented frame, to skip identical repaints.
+    painted: Option<(Vec<egui::epaint::ClippedShape>, f32, [u32; 2])>,
 }
+
+/// Shortest time between scheduled egui passes (~60 per second).
+const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 struct Shell {
     ctx: egui::Context,
     state: Option<WindowState>,
     next_repaint: Option<Instant>,
+    /// Start of the last egui pass, for [`MIN_FRAME_INTERVAL`].
+    last_pass: Option<Instant>,
     autostart: bool,
     error: Option<anyhow::Error>,
+    stats: FrameStats,
 }
 
 impl Shell {
@@ -1384,31 +1396,43 @@ impl Shell {
             app,
             renderer: Default::default(),
             close_requested: false,
+            painted: None,
         });
         self.schedule(Instant::now());
         Ok(())
     }
 
-    fn frame(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) -> anyhow::Result<()> {
+    /// Runs one egui pass and paints it. `force` repaints even an unchanged frame, for
+    /// redraws Windows asks for (the window contents were lost).
+    fn frame(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        force: bool,
+    ) -> anyhow::Result<()> {
         let Some(state) = &mut self.state else {
             return Ok(());
         };
         self.next_repaint = None;
+        self.last_pass = Some(Instant::now());
         let mut input = state.input.take_egui_input(&state.window);
         let info = input.viewports.entry(egui::ViewportId::ROOT).or_default();
         egui_winit::update_viewport_info(info, &self.ctx, &state.window, false);
         if std::mem::take(&mut state.close_requested) {
             info.events.push(egui::ViewportEvent::Close);
         }
+        let started = Instant::now();
         let mut output = self.ctx.run_ui(input, |ui| {
             state.app.logic(ui.ctx());
             state.app.ui(ui);
             // Tray state and focus debounce must progress even while hidden/idle.
             ui.ctx().request_repaint_after(Duration::from_secs(1));
         });
+        self.stats.pass();
+        self.stats.stage(Stage::Ui, started);
         state
             .input
             .handle_platform_output(&state.window, output.platform_output);
+        let textures_changed = !output.textures_delta.set.is_empty();
         state.renderer.update_textures(&mut output.textures_delta);
         let mut show = false;
         let mut focus = false;
@@ -1446,7 +1470,28 @@ impl Shell {
             return Ok(());
         }
         let size = state.window.inner_size();
-        if (show || state.window.is_visible() == Some(true))
+        let visible = show || state.window.is_visible() == Some(true);
+        let full = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(size.width as f32, size.height as f32),
+        );
+        // Only the area that changed since the last presented frame is redrawn: each pixel
+        // costs real CPU time, and a hover usually changes one small widget.
+        let region = match &state.painted {
+            Some((shapes, ppp, sz))
+                if !force
+                    && !show
+                    && !textures_changed
+                    && *ppp == output.pixels_per_point
+                    && *sz == [size.width, size.height] =>
+            {
+                let area = (changed_area(shapes, &output.shapes) * *ppp).expand(2.0);
+                egui::Rect::from_min_max(area.min.floor(), area.max.ceil()).intersect(full)
+            }
+            _ => full,
+        };
+        if visible
+            && !region.is_negative()
             && let (Some(width), Some(height)) = (
                 std::num::NonZeroU32::new(size.width),
                 std::num::NonZeroU32::new(size.height),
@@ -1456,22 +1501,53 @@ impl Shell {
                 .surface
                 .resize(width, height)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let primitives = self.ctx.tessellate(output.shapes, output.pixels_per_point);
+            let started = Instant::now();
+            let primitives = self
+                .ctx
+                .tessellate(output.shapes.clone(), output.pixels_per_point);
+            self.stats.stage(Stage::Tessellate, started);
             let mut buffer = state
                 .surface
                 .buffer_mut()
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            // The buffer keeps the previous frame only once it has been presented.
+            let region = if buffer.age() == 0 { full } else { region };
+            let started = Instant::now();
             state.renderer.paint(
                 &primitives,
                 output.pixels_per_point,
                 [size.width as usize, size.height as usize],
                 // Match eframe's clear color behind the rounded egui panel.
                 egui::Color32::from_rgba_unmultiplied(12, 12, 12, 180),
+                region,
                 &mut buffer,
             );
-            buffer.present().map_err(|e| anyhow::anyhow!("{e}"))?;
+            self.stats.stage(Stage::Raster, started);
+            let started = Instant::now();
+            let damage = softbuffer::Rect {
+                x: region.min.x as u32,
+                y: region.min.y as u32,
+                width: NonZeroU32::new(region.width() as u32).unwrap_or(width),
+                height: NonZeroU32::new(region.height() as u32).unwrap_or(height),
+            };
+            buffer
+                .present_with_damage(&[damage])
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            self.stats.stage(Stage::Present, started);
+            self.stats.painted(
+                (region.width() * region.height()) as u64,
+                size.width as u64 * size.height as u64,
+            );
+            state.painted = Some((
+                output.shapes,
+                output.pixels_per_point,
+                [size.width, size.height],
+            ));
+        } else if !visible {
+            state.painted = None;
         }
         state.renderer.free_textures(&mut output.textures_delta);
+        self.stats.flush_if_due();
         // Present before showing: neither normal launch nor autostart can flash an empty window.
         if show {
             state.window.set_visible(true);
@@ -1492,6 +1568,41 @@ impl Shell {
         self.error = Some(error);
         event_loop.exit();
     }
+}
+
+/// Area (in points) where `next` differs from `prev`; negative when nothing changed.
+///
+/// Shapes the two frames share at the start and end are skipped, so a tooltip or row that
+/// appears or disappears costs only its own area. What is left is compared shape by shape
+/// when both sides have the same count, and taken whole otherwise.
+fn changed_area(
+    prev: &[egui::epaint::ClippedShape],
+    next: &[egui::epaint::ClippedShape],
+) -> egui::Rect {
+    let prefix = prev.iter().zip(next).take_while(|(a, b)| a == b).count();
+    let suffix = prev[prefix..]
+        .iter()
+        .rev()
+        .zip(next[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let prev = &prev[prefix..prev.len() - suffix];
+    let next = &next[prefix..next.len() - suffix];
+    let bounds =
+        |s: &egui::epaint::ClippedShape| s.shape.visual_bounding_rect().intersect(s.clip_rect);
+    let mut area = egui::Rect::NOTHING;
+    if prev.len() == next.len() {
+        for (a, b) in prev.iter().zip(next) {
+            if a != b {
+                area = area.union(bounds(a)).union(bounds(b));
+            }
+        }
+    } else {
+        for s in prev.iter().chain(next) {
+            area = area.union(bounds(s));
+        }
+    }
+    area
 }
 
 impl winit::application::ApplicationHandler<Repaint> for Shell {
@@ -1522,7 +1633,7 @@ impl winit::application::ApplicationHandler<Repaint> for Shell {
             state.close_requested = true;
         }
         if matches!(event, WindowEvent::RedrawRequested) {
-            if let Err(e) = self.frame(event_loop) {
+            if let Err(e) = self.frame(event_loop, true) {
                 self.fail(event_loop, e);
             }
         } else if response.repaint
@@ -1540,9 +1651,16 @@ impl winit::application::ApplicationHandler<Repaint> for Shell {
         event_loop: &winit::event_loop::ActiveEventLoop,
         _cause: winit::event::StartCause,
     ) {
-        if self.next_repaint.is_some_and(|at| at <= Instant::now())
-            && let Err(e) = self.frame(event_loop)
+        let now = Instant::now();
+        if !self.next_repaint.is_some_and(|at| at <= now) {
+            return;
+        }
+        // At most ~60 passes a second: moving the pointer otherwise asks for one per event.
+        if let Some(earliest) = self.last_pass.map(|at| at + MIN_FRAME_INTERVAL)
+            && earliest > now
         {
+            self.next_repaint = Some(earliest);
+        } else if let Err(e) = self.frame(event_loop, false) {
             self.fail(event_loop, e);
         }
     }
@@ -1575,8 +1693,10 @@ pub fn run() -> anyhow::Result<()> {
         ctx,
         state: None,
         next_repaint: None,
+        last_pass: None,
         autostart,
         error: None,
+        stats: FrameStats::from_env(),
     };
     event_loop.run_app(&mut shell)?;
     // Quit sent Shutdown: give the engine a moment to unmute the speakers and stop.
@@ -1593,6 +1713,35 @@ pub fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    fn rect(x: f32) -> egui::epaint::ClippedShape {
+        egui::epaint::ClippedShape {
+            clip_rect: egui::Rect::EVERYTHING,
+            shape: egui::epaint::Shape::rect_filled(
+                egui::Rect::from_min_max(egui::pos2(x, 0.0), egui::pos2(x + 1.0, 1.0)),
+                0.0,
+                egui::Color32::RED,
+            ),
+        }
+    }
+
+    fn x_span(r: egui::Rect) -> (f32, f32) {
+        (r.min.x, r.max.x)
+    }
+
+    #[test]
+    fn changed_area_covers_only_what_changed() {
+        let base = [rect(0.0), rect(10.0), rect(20.0)];
+        assert!(changed_area(&base, &base).is_negative());
+        // Same count: only the shape that changed.
+        let moved = [rect(0.0), rect(12.0), rect(20.0)];
+        assert_eq!(x_span(changed_area(&base, &moved)), (10.0, 13.0));
+        // A shape inserted in the middle (a tooltip): only its own area.
+        let inserted = [rect(0.0), rect(10.0), rect(30.0), rect(20.0)];
+        assert_eq!(x_span(changed_area(&base, &inserted)), (30.0, 31.0));
+        // And removed again.
+        assert_eq!(x_span(changed_area(&inserted, &base)), (30.0, 31.0));
+    }
+
     use super::*;
 
     #[test]

@@ -155,6 +155,7 @@ pub struct ProcessLoopbackSource {
     consumer: rtrb::Consumer<f32>,
     discontinuity_tracker: Arc<DiscontinuityTracker>,
     last_read_instant: Instant,
+    data_signal: Arc<crate::DataSignal>,
     stop_signal: Arc<AtomicBool>,
     thread_handle: Option<JoinHandle<()>>,
     is_started: bool,
@@ -191,11 +192,13 @@ impl ProcessLoopbackSource {
 
         let discontinuity_tracker = Arc::new(DiscontinuityTracker::new());
         let stop_signal = Arc::new(AtomicBool::new(false));
+        let data_signal = Arc::new(crate::DataSignal::default());
 
         let thread_stop = stop_signal.clone();
         let thread_discontinuity = discontinuity_tracker.clone();
         let thread_pid = config.target_process_id;
         let thread_mode = config.mode;
+        let thread_data = data_signal.clone();
 
         let thread_handle = std::thread::Builder::new()
             .name("wasapi-process-loopback".into())
@@ -205,6 +208,7 @@ impl ProcessLoopbackSource {
                     thread_mode,
                     producer,
                     thread_discontinuity,
+                    thread_data,
                     thread_stop,
                 );
             })?;
@@ -215,6 +219,7 @@ impl ProcessLoopbackSource {
             consumer,
             discontinuity_tracker,
             last_read_instant: Instant::now(),
+            data_signal,
             stop_signal,
             thread_handle: Some(thread_handle),
             is_started: false,
@@ -240,6 +245,10 @@ impl ProcessLoopbackSource {
 impl AudioSource for ProcessLoopbackSource {
     fn is_live(&self) -> bool {
         true
+    }
+
+    fn data_signal(&self) -> Option<Arc<crate::DataSignal>> {
+        Some(self.data_signal.clone())
     }
 
     fn sample_rate(&self) -> u32 {
@@ -274,13 +283,7 @@ impl AudioSource for ProcessLoopbackSource {
 
         let max_samples = max_frames * channels;
         let mut samples = Vec::with_capacity(max_samples);
-
-        while samples.len() < max_samples {
-            match self.consumer.pop() {
-                Ok(sample) => samples.push(sample),
-                Err(rtrb::PopError::Empty) => break,
-            }
-        }
+        super::pop_frames(&mut self.consumer, max_samples, channels, &mut samples);
 
         if samples.is_empty() {
             // No captured data right now (WASAPI delivers every ~10 ms). Report "nothing yet"
@@ -399,6 +402,7 @@ fn run_process_capture_loop(
     mode: ProcessLoopbackMode,
     mut producer: rtrb::Producer<f32>,
     discontinuity_tracker: Arc<DiscontinuityTracker>,
+    data_signal: Arc<crate::DataSignal>,
     stop_signal: Arc<AtomicBool>,
 ) {
     let _com = match ComMtaGuard::new() {
@@ -525,11 +529,13 @@ fn run_process_capture_loop(
                         )
                         .is_ok()
                     {
-                        for &sample in &sample_buf {
-                            if producer.push(sample).is_err() {
-                                discontinuity_tracker.record_packet(FLAG_DATA_DISCONTINUITY, 1);
-                            }
+                        let channels = format_info.channels as usize;
+                        let dropped = super::push_frames(&mut producer, &sample_buf, channels);
+                        if dropped > 0 {
+                            discontinuity_tracker
+                                .record_packet(FLAG_DATA_DISCONTINUITY, dropped / channels.max(1));
                         }
+                        data_signal.notify();
                     }
                 }
 

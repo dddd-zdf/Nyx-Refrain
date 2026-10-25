@@ -970,6 +970,7 @@ mod win {
     use windows::Media::Control::{
         GlobalSystemMediaTransportControlsSession,
         GlobalSystemMediaTransportControlsSessionManager,
+        GlobalSystemMediaTransportControlsSessionMediaProperties,
         GlobalSystemMediaTransportControlsSessionPlaybackStatus,
     };
     use windows::Storage::Streams::DataReader;
@@ -988,13 +989,21 @@ mod win {
 
         let mut prev: Option<NowPlaying> = None;
         let mut prev_time = Instant::now();
-        let mut artwork = ArtworkCache::default();
+        let mut manager = None;
+        let mut thumbnail = Thumbnail::default();
+
+        // Between polls, wait on the command channel instead of waking every 50 ms: commands
+        // run as soon as they arrive, and dropping the watcher closes the channel.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .ok();
 
         let mut selected = None;
         let mut next_poll = Instant::now();
         while !stop.load(Ordering::Relaxed) {
             if Instant::now() >= next_poll {
-                let mut current = match poll_windows_media() {
+                let current = match poll_windows_media(&mut manager, &mut thumbnail) {
                     Some((session, info)) => {
                         selected = Some(session);
                         info
@@ -1004,7 +1013,6 @@ mod win {
                         NowPlaying::default()
                     }
                 };
-                current.artwork = artwork.fit(current.artwork.take());
                 let now = Instant::now();
                 if should_publish(&prev, prev_time, &current, now) {
                     prev = Some(current.clone());
@@ -1013,27 +1021,42 @@ mod win {
                 }
                 next_poll = now + Duration::from_secs(1);
             }
-            while let Ok(command) = commands.try_recv() {
-                if stop.load(Ordering::Relaxed) {
-                    break;
+            let wait = next_poll.saturating_duration_since(Instant::now());
+            let command = match &rt {
+                // The timeout must be created inside the runtime, hence the async block.
+                Some(rt) => {
+                    match rt.block_on(async { tokio::time::timeout(wait, commands.recv()).await }) {
+                        Ok(Some(command)) => Some(command),
+                        // The watcher was dropped.
+                        Ok(None) => break,
+                        // The next poll is due.
+                        Err(_) => None,
+                    }
                 }
-                let Some(session) = &selected else {
-                    tracing::debug!(
-                        ?command,
-                        "nowplaying: no selected SMTC session; ignoring control"
-                    );
-                    continue;
-                };
-                match control(session, command) {
-                    Ok(true) => tracing::debug!(?command, "nowplaying: SMTC command sent"),
-                    Ok(false) => tracing::debug!(
-                        ?command,
-                        "nowplaying: SMTC action unsupported, rejected, or duration unavailable; ignored"
-                    ),
-                    Err(e) => tracing::debug!(?command, "nowplaying: SMTC control failed: {e}"),
+                None => {
+                    std::thread::sleep(wait.min(Duration::from_millis(50)));
+                    commands.try_recv().ok()
                 }
+            };
+            let Some(command) = command else { continue };
+            if stop.load(Ordering::Relaxed) {
+                break;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            let Some(session) = &selected else {
+                tracing::debug!(
+                    ?command,
+                    "nowplaying: no selected SMTC session; ignoring control"
+                );
+                continue;
+            };
+            match control(session, command) {
+                Ok(true) => tracing::debug!(?command, "nowplaying: SMTC command sent"),
+                Ok(false) => tracing::debug!(
+                    ?command,
+                    "nowplaying: SMTC action unsupported, rejected, or duration unavailable; ignored"
+                ),
+                Err(e) => tracing::debug!(?command, "nowplaying: SMTC control failed: {e}"),
+            }
         }
 
         unsafe {
@@ -1041,10 +1064,87 @@ mod win {
         }
     }
 
-    fn poll_windows_media() -> Option<(GlobalSystemMediaTransportControlsSession, NowPlaying)> {
-        let op = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().ok()?;
-        let manager = op.get().ok()?;
-        let session = manager.GetCurrentSession().ok()?;
+    /// How long after a track change the cover is re-read from SMTC. Players often publish the
+    /// new title before the new cover, so one read at the change could keep the old one.
+    const THUMBNAIL_REFRESH_WINDOW: Duration = Duration::from_secs(5);
+
+    /// The current cover, copied out of the player only around track changes: re-reading it
+    /// on every 1 s poll (hundreds of KiB through WinRT, then hashed) was the watcher's main
+    /// cost while music played.
+    #[derive(Default)]
+    struct Thumbnail {
+        /// Source app, title, artist and album of the track `current` belongs to.
+        key: Option<[String; 4]>,
+        changed_at: Option<Instant>,
+        /// The player offered no cover on the last read; checking again is cheap.
+        missing: bool,
+        current: Option<Artwork>,
+        fit: ArtworkCache,
+    }
+
+    impl Thumbnail {
+        fn get(
+            &mut self,
+            key: [String; 4],
+            props: &GlobalSystemMediaTransportControlsSessionMediaProperties,
+        ) -> Option<Artwork> {
+            let now = Instant::now();
+            if self.key.as_ref() != Some(&key) {
+                self.key = Some(key);
+                self.changed_at = Some(now);
+            }
+            let recent = self
+                .changed_at
+                .is_some_and(|at| now.duration_since(at) <= THUMBNAIL_REFRESH_WINDOW);
+            if recent || self.missing {
+                let raw = read_thumbnail(props);
+                self.missing = raw.is_none();
+                self.current = self.fit.fit(raw);
+            }
+            self.current.clone()
+        }
+    }
+
+    fn read_thumbnail(
+        props: &GlobalSystemMediaTransportControlsSessionMediaProperties,
+    ) -> Option<Artwork> {
+        let stream = props.Thumbnail().ok()?.OpenReadAsync().ok()?.get().ok()?;
+        let size = stream.Size().unwrap_or(0) as usize;
+        if size == 0 || size > MAX_SOURCE_ARTWORK_BYTES {
+            return None;
+        }
+        let reader = DataReader::CreateDataReader(&stream).ok()?;
+        reader.LoadAsync(size as u32).ok()?.get().ok()?;
+        let content_type = stream
+            .ContentType()
+            .map(|h| h.to_string())
+            .unwrap_or_default();
+        let mut bytes = vec![0u8; size];
+        reader.ReadBytes(&mut bytes).ok()?;
+        // Trust the bytes: SMTC sources report lists such as
+        // "image/jpeg,image/jpe,image/jpg" (foobar2000).
+        let mime = match image_type(&bytes) {
+            Some(m) => m.to_string(),
+            None if content_type.starts_with("image/") => content_type
+                .split(',')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            None => return None,
+        };
+        Some(Artwork { mime, bytes })
+    }
+
+    fn poll_windows_media(
+        manager: &mut Option<GlobalSystemMediaTransportControlsSessionManager>,
+        thumbnail: &mut Thumbnail,
+    ) -> Option<(GlobalSystemMediaTransportControlsSession, NowPlaying)> {
+        if manager.is_none() {
+            let op = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().ok()?;
+            *manager = Some(op.get().ok()?);
+        }
+        let session = manager.as_ref()?.GetCurrentSession().ok()?;
         let mut np = NowPlaying::default();
 
         if let Ok(op) = session.TryGetMediaPropertiesAsync()
@@ -1059,41 +1159,12 @@ mod win {
             if let Ok(al) = props.AlbumTitle() {
                 np.album = al.to_string();
             }
-            if let Ok(thumb_ref) = props.Thumbnail()
-                && let Ok(stream_op) = thumb_ref.OpenReadAsync()
-                && let Ok(stream) = stream_op.get()
-            {
-                let size = stream.Size().unwrap_or(0) as usize;
-                if size > 0
-                    && size <= MAX_SOURCE_ARTWORK_BYTES
-                    && let Ok(reader) = DataReader::CreateDataReader(&stream)
-                    && let Ok(load_op) = reader.LoadAsync(size as u32)
-                    && load_op.get().is_ok()
-                {
-                    let content_type = stream
-                        .ContentType()
-                        .map(|h| h.to_string())
-                        .unwrap_or_default();
-                    let mut bytes = vec![0u8; size];
-                    if reader.ReadBytes(&mut bytes).is_ok() {
-                        // Trust the bytes: SMTC sources report lists such as
-                        // "image/jpeg,image/jpe,image/jpg" (foobar2000).
-                        let mime = match image_type(&bytes) {
-                            Some(m) => m.to_string(),
-                            None if content_type.starts_with("image/") => content_type
-                                .split(',')
-                                .next()
-                                .unwrap_or_default()
-                                .trim()
-                                .to_string(),
-                            None => String::new(),
-                        };
-                        if !mime.is_empty() {
-                            np.artwork = Some(Artwork { mime, bytes });
-                        }
-                    }
-                }
-            }
+            let app = session
+                .SourceAppUserModelId()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let key = [app, np.title.clone(), np.artist.clone(), np.album.clone()];
+            np.artwork = thumbnail.get(key, &props);
         }
 
         if let Ok(playback) = session.GetPlaybackInfo()
