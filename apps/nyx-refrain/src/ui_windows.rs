@@ -838,6 +838,8 @@ fn configure_styles(ctx: &egui::Context) {
         .into();
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(8.0, 4.0);
+        // Hover fades cost several full CPU-rendered frames each; change state instantly.
+        style.animation_time = 0.0;
     });
 }
 
@@ -1270,6 +1272,8 @@ struct WindowState {
     renderer: crate::soft_render::Renderer,
     app: App,
     close_requested: bool,
+    /// Shapes, scale and size of the last presented frame, to skip identical repaints.
+    painted: Option<(Vec<egui::epaint::ClippedShape>, f32, [u32; 2])>,
 }
 
 struct Shell {
@@ -1331,12 +1335,19 @@ impl Shell {
             app,
             renderer: Default::default(),
             close_requested: false,
+            painted: None,
         });
         self.schedule(Instant::now());
         Ok(())
     }
 
-    fn frame(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) -> anyhow::Result<()> {
+    /// Runs one egui pass and paints it. `force` repaints even an unchanged frame, for
+    /// redraws Windows asks for (the window contents were lost).
+    fn frame(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        force: bool,
+    ) -> anyhow::Result<()> {
         let Some(state) = &mut self.state else {
             return Ok(());
         };
@@ -1356,6 +1367,7 @@ impl Shell {
         state
             .input
             .handle_platform_output(&state.window, output.platform_output);
+        let textures_changed = !output.textures_delta.set.is_empty();
         state.renderer.update_textures(&mut output.textures_delta);
         let mut show = false;
         let mut focus = false;
@@ -1398,12 +1410,24 @@ impl Shell {
                 std::num::NonZeroU32::new(size.width),
                 std::num::NonZeroU32::new(size.height),
             )
+            && (force
+                || show
+                || textures_changed
+                || !state.painted.as_ref().is_some_and(|(shapes, ppp, sz)| {
+                    // Most pointer moves and repaint requests change nothing on screen, and
+                    // each CPU-rendered frame redraws every pixel of the window.
+                    *ppp == output.pixels_per_point
+                        && *sz == [size.width, size.height]
+                        && *shapes == output.shapes
+                }))
         {
             state
                 .surface
                 .resize(width, height)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let primitives = self.ctx.tessellate(output.shapes, output.pixels_per_point);
+            let primitives = self
+                .ctx
+                .tessellate(output.shapes.clone(), output.pixels_per_point);
             let mut buffer = state
                 .surface
                 .buffer_mut()
@@ -1417,6 +1441,13 @@ impl Shell {
                 &mut buffer,
             );
             buffer.present().map_err(|e| anyhow::anyhow!("{e}"))?;
+            state.painted = Some((
+                output.shapes,
+                output.pixels_per_point,
+                [size.width, size.height],
+            ));
+        } else if state.window.is_visible() != Some(true) {
+            state.painted = None;
         }
         state.renderer.free_textures(&mut output.textures_delta);
         // Present before showing: neither normal launch nor autostart can flash an empty window.
@@ -1469,7 +1500,7 @@ impl winit::application::ApplicationHandler<Repaint> for Shell {
             state.close_requested = true;
         }
         if matches!(event, WindowEvent::RedrawRequested) {
-            if let Err(e) = self.frame(event_loop) {
+            if let Err(e) = self.frame(event_loop, true) {
                 self.fail(event_loop, e);
             }
         } else if response.repaint
@@ -1488,7 +1519,7 @@ impl winit::application::ApplicationHandler<Repaint> for Shell {
         _cause: winit::event::StartCause,
     ) {
         if self.next_repaint.is_some_and(|at| at <= Instant::now())
-            && let Err(e) = self.frame(event_loop)
+            && let Err(e) = self.frame(event_loop, false)
         {
             self.fail(event_loop, e);
         }
