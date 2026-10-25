@@ -12,6 +12,8 @@ mod soft_render;
 pub mod tray_menu;
 
 #[cfg(windows)]
+mod frame_stats;
+#[cfg(windows)]
 mod position;
 #[cfg(windows)]
 mod ui_windows;

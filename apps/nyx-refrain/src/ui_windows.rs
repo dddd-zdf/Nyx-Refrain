@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::engine::{self, Cmd, DeviceEntry, Engine, Firewall, StartParams, State};
+use crate::frame_stats::{FrameStats, Stage};
 use crate::i18n::{
     Key, Lang, engine_error_detail, engine_error_title, format_firewall_error,
     format_stats_columns, format_stats_detail, t,
@@ -1335,6 +1336,7 @@ struct Shell {
     next_repaint: Option<Instant>,
     autostart: bool,
     error: Option<anyhow::Error>,
+    stats: FrameStats,
 }
 
 impl Shell {
@@ -1411,12 +1413,15 @@ impl Shell {
         if std::mem::take(&mut state.close_requested) {
             info.events.push(egui::ViewportEvent::Close);
         }
+        let started = Instant::now();
         let mut output = self.ctx.run_ui(input, |ui| {
             state.app.logic(ui.ctx());
             state.app.ui(ui);
             // Tray state and focus debounce must progress even while hidden/idle.
             ui.ctx().request_repaint_after(Duration::from_secs(1));
         });
+        self.stats.pass();
+        self.stats.stage(Stage::Ui, started);
         state
             .input
             .handle_platform_output(&state.window, output.platform_output);
@@ -1478,13 +1483,16 @@ impl Shell {
                 .surface
                 .resize(width, height)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let started = Instant::now();
             let primitives = self
                 .ctx
                 .tessellate(output.shapes.clone(), output.pixels_per_point);
+            self.stats.stage(Stage::Tessellate, started);
             let mut buffer = state
                 .surface
                 .buffer_mut()
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let started = Instant::now();
             state.renderer.paint(
                 &primitives,
                 output.pixels_per_point,
@@ -1493,7 +1501,12 @@ impl Shell {
                 egui::Color32::from_rgba_unmultiplied(12, 12, 12, 180),
                 &mut buffer,
             );
+            self.stats.stage(Stage::Raster, started);
+            let started = Instant::now();
             buffer.present().map_err(|e| anyhow::anyhow!("{e}"))?;
+            self.stats.stage(Stage::Present, started);
+            let pixels = size.width as u64 * size.height as u64;
+            self.stats.painted(pixels, pixels);
             state.painted = Some((
                 output.shapes,
                 output.pixels_per_point,
@@ -1503,6 +1516,7 @@ impl Shell {
             state.painted = None;
         }
         state.renderer.free_textures(&mut output.textures_delta);
+        self.stats.flush_if_due();
         // Present before showing: neither normal launch nor autostart can flash an empty window.
         if show {
             state.window.set_visible(true);
@@ -1608,6 +1622,7 @@ pub fn run() -> anyhow::Result<()> {
         next_repaint: None,
         autostart,
         error: None,
+        stats: FrameStats::from_env(),
     };
     event_loop.run_app(&mut shell)?;
     // Quit sent Shutdown: give the engine a moment to unmute the speakers and stop.
