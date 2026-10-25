@@ -232,6 +232,9 @@ pub fn start_pipeline_feeder(
                 processor.set_target_fill_level(LIVE_TARGET_FILL_PACKETS);
             }
             let _ = source.start();
+            // Sources that signal new audio let this thread sleep until a packet arrives
+            // instead of waking every few ms to poll.
+            let data_signal = source.data_signal();
             let mut packets_batch = Vec::with_capacity(8);
             let mut last_activity = Instant::now();
 
@@ -239,6 +242,7 @@ pub fn start_pipeline_feeder(
             let read_frames = (sample_rate / 100).max(128) as usize;
 
             while !stop_signal.load(Ordering::Relaxed) {
+                let mut idle = false;
                 match source.read_chunk(read_frames) {
                     Ok(Some(chunk)) => {
                         last_activity = Instant::now();
@@ -264,8 +268,8 @@ pub fn start_pipeline_feeder(
                         }
                     }
                     Ok(None) => {
-                        // EOF / End of stream: sleep briefly
-                        std::thread::sleep(Duration::from_millis(5));
+                        // Nothing yet / end of stream: wait a little longer below
+                        idle = true;
                     }
                     Err(e) => {
                         tracing::warn!("Error reading from AudioSource: {e}");
@@ -286,7 +290,17 @@ pub fn start_pipeline_feeder(
                     last_activity = Instant::now();
                 }
 
-                std::thread::sleep(Duration::from_millis(2));
+                match &data_signal {
+                    // Got audio: read again at once so a burst of packets never leaves a backlog.
+                    Some(_) if !idle => {}
+                    // Capped at one WASAPI period so the underrun check above keeps pace.
+                    Some(signal) => signal.wait(
+                        underrun_timeout
+                            .saturating_sub(last_activity.elapsed())
+                            .clamp(Duration::from_millis(1), Duration::from_millis(10)),
+                    ),
+                    None => std::thread::sleep(Duration::from_millis(if idle { 7 } else { 2 })),
+                }
             }
 
             let _ = source.stop();

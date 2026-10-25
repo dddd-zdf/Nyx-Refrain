@@ -441,6 +441,10 @@ impl capture::AudioSource for SharedSource {
     fn is_live(&self) -> bool {
         self.lock().is_live()
     }
+
+    fn data_signal(&self) -> Option<Arc<capture::DataSignal>> {
+        self.lock().data_signal()
+    }
 }
 
 #[cfg(target_os = "linux")]

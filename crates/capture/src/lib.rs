@@ -4,6 +4,7 @@
 //! on Linux, WASAPI loopback on Windows, sine/silence/wav/stdin test sources
 //! for cross-platform testing).
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub mod discontinuity;
@@ -92,6 +93,35 @@ impl AudioChunk {
     }
 }
 
+/// Wakes the thread reading a capture source when the capture thread queues new audio.
+#[derive(Debug, Default)]
+pub struct DataSignal {
+    reader: Mutex<Option<std::thread::Thread>>,
+}
+
+impl DataSignal {
+    /// Called by the capture thread after queuing audio.
+    pub fn notify(&self) {
+        if let Ok(reader) = self.reader.lock()
+            && let Some(thread) = reader.as_ref()
+        {
+            thread.unpark();
+        }
+    }
+
+    /// Blocks the calling thread until the next [`DataSignal::notify`] or `timeout`. A notify
+    /// that arrived since this thread's previous wait returns at once, so none is lost.
+    pub fn wait(&self, timeout: Duration) {
+        let current = std::thread::current();
+        if let Ok(mut reader) = self.reader.lock()
+            && reader.as_ref().map(|t| t.id()) != Some(current.id())
+        {
+            *reader = Some(current);
+        }
+        std::thread::park_timeout(timeout);
+    }
+}
+
 /// Common trait for all audio capture sources (loopback, sine, wav, stdin).
 pub trait AudioSource: Send {
     /// Sample rate in Hz (e.g., 44100).
@@ -124,6 +154,12 @@ pub trait AudioSource: Send {
     /// return false and are paced by back-pressure.
     fn is_live(&self) -> bool {
         false
+    }
+
+    /// Signal raised whenever new audio is queued, so readers can block instead of polling.
+    /// `None` (the default) means the reader must poll.
+    fn data_signal(&self) -> Option<Arc<DataSignal>> {
+        None
     }
 
     fn stop(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
