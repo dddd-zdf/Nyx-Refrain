@@ -23,7 +23,7 @@ Nyx Refrain is an AirPlay 2 realtime sender written in pure Rust. It does its ow
 
 - **Low-latency streaming**: AirPlay 2 realtime mode with three latency profiles (about 97 / 137 / 237 ms). Clock drift between the PC and the speaker is compensated automatically, so long sessions stay in tune and don't drop out.
 - **Windows tray app**: a Windows 11-style tray flyout, with every common action also in the right-click menu. The UI is rendered on the CPU, needs no graphics driver, works in VMs without a GPU, and uses only a few MiB of memory when idle.
-- **Per-process capture (Windows)**: captures each application's audio directly by default, so laptop speaker effects don't leak into the stream and muting the local speakers doesn't silence the speaker you're streaming to. You can switch back to classic device loopback capture in the settings.
+- **Per-process capture (Windows)**: captures each application's audio directly by default, so laptop speaker effects don't leak into the stream and the PC's own speakers are muted while streaming so you don't hear them out of sync with the speaker (unmuted again when you stop). You can switch back to classic device loopback capture in the settings.
 - **Linux tray and virtual sound card**: controlled from a StatusNotifierItem tray (native on KDE, an extension on GNOME). While streaming, a PipeWire virtual output named "Nyx Refrain (AirPlay)" is created and set as the default output; it is removed again when you stop.
 - **Track info and artwork**: sends the title, artist, album and artwork of what's playing on your PC to the speaker (Windows SMTC / Linux MPRIS).
 - **Control from the speaker**: play, pause, previous and next pressed on the HomePod or in Home Assistant are passed to the player on your PC, and volume changes made on the speaker are synced back.
@@ -80,7 +80,7 @@ sudo pacman -U ./nyx-refrain-*.pkg.tar.zst    # Arch Linux
 
 **Windows Firewall**: AirPlay 2 needs the speaker to connect back to your PC (timing and control channels), so Nyx Refrain must be allowed to accept inbound connections. On first use, if the flyout says the firewall is blocking it, click **Allow in Firewall** (this asks for administrator permission).
 
-**Settings** (the ⚙ in the top-right corner of the flyout on Windows, the tray menu on Linux): **Language**, **Send now playing**, **Allow receiver playback controls**, **Resume streaming on launch**, **Launch at login**; Windows also has **Use device loopback capture**.
+**Settings** (the ⚙ in the top-right corner of the flyout on Windows, the tray menu on Linux): **Language**, **Send now playing**, **Allow receiver playback controls**, **Resume streaming on launch**, **Launch at login**; Windows also has **Use device loopback capture** and **Mute this PC while streaming** (on by default; not available with device loopback capture).
 
 ### Command line: `nyxr`
 
