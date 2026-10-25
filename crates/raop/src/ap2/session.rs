@@ -159,6 +159,16 @@ struct Conn {
 /// metadata is disabled for the session.
 const METADATA_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long the keep-alive and volume requests wait for the receiver. The engine awaits them
+/// in its command loop, so an unbounded wait on a receiver that stopped answering (heavy
+/// Wi-Fi loss) froze the app: no reconnect, and Stop did nothing. A timed-out keep-alive
+/// fails the session, which the engine then reconnects.
+const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long [`Ap2Session::stop`] waits for the TEARDOWN response; the session is closed
+/// either way, so this only keeps Stop from feeling stuck.
+const TEARDOWN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 impl Conn {
     fn log(&mut self, dir: &str, text: &[u8]) {
         let printable = String::from_utf8_lossy(text);
@@ -1127,22 +1137,24 @@ impl Ap2Session {
         let uri = self.uri.clone();
         let body = format!("volume: {:.1}", volume_db.clamp(-144.0, 0.0)).into_bytes();
         self.conn
-            .request(
-                false,
+            .request_bounded(
                 "SET_PARAMETER",
                 &uri,
                 &[],
                 Some(("text/parameters", body)),
+                CONTROL_RESPONSE_TIMEOUT,
             )
             .await
+            .map_err(|_| Ap2Error::Rtsp("timed out waiting for volume response".into()))?
             .map(|_| ())
     }
 
     /// Sends `POST /feedback` (keep-alive, pyatv every 2 s).
     pub async fn feedback(&mut self) -> Result<(), Ap2Error> {
         self.conn
-            .request(false, "POST", "/feedback", &[], None)
+            .request_bounded("POST", "/feedback", &[], None, CONTROL_RESPONSE_TIMEOUT)
             .await
+            .map_err(|_| Ap2Error::Rtsp("timed out waiting for feedback response".into()))?
             .map(|_| ())
     }
 
@@ -1397,12 +1409,20 @@ impl Ap2Session {
             let _ = t.join();
         }
         let uri = self.uri.clone();
-        if let Err(e) = self
+        match self
             .conn
-            .request(false, "TEARDOWN", &uri, &[("Session", "0".into())], None)
+            .request_bounded(
+                "TEARDOWN",
+                &uri,
+                &[("Session", "0".into())],
+                None,
+                TEARDOWN_RESPONSE_TIMEOUT,
+            )
             .await
         {
-            warn!("AP2 TEARDOWN failed: {e}");
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!("AP2 TEARDOWN failed: {e}"),
+            Err(_) => warn!("AP2 TEARDOWN: no response; closing anyway"),
         }
     }
 }
