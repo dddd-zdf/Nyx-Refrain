@@ -206,7 +206,7 @@ pub fn build_menu_model(
         .iter()
         .map(|(p, key)| TrayMenuItem {
             label: t(lang, *key).to_string(),
-            enabled: !active,
+            enabled: snap.state != State::Connecting,
             kind: MenuItemKind::Radio {
                 selected: settings.profile == *p,
             },
@@ -446,9 +446,22 @@ pub fn apply_action<F>(
             }
         }
         TrayMenuAction::SelectProfile(profile) => {
-            if let Ok(mut s) = settings.lock() {
+            // The latency is fixed when the stream starts: restart a running stream.
+            let snap = engine.snapshot();
+            let restart_params = if let Ok(mut s) = settings.lock() {
+                let changed = s.profile != *profile;
                 s.profile = *profile;
                 s.save();
+                if changed && snap.state == State::Streaming {
+                    build_start_params(&snap.devices, &s)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(params) = restart_params {
+                engine.send(Cmd::Start(params));
             }
         }
         TrayMenuAction::SetVolume(vol) => {
@@ -698,10 +711,15 @@ mod tests {
         assert_eq!(items[1].label, t(Lang::ZhCn, Key::TrayStop));
         assert!(items[1].enabled);
 
-        // Device and Profile options are disabled while active
-        if let MenuItemKind::Submenu(sub) = &items[4].kind {
-            assert!(!sub[0].enabled);
-        }
+        // Profiles can switch while streaming (the stream restarts)
+        let profile = items
+            .iter()
+            .find(|i| i.label == t(Lang::ZhCn, Key::LatencyProfile))
+            .unwrap();
+        let MenuItemKind::Submenu(sub) = &profile.kind else {
+            panic!("profile item is not a submenu");
+        };
+        assert!(sub.iter().all(|i| i.enabled));
     }
 
     #[test]
