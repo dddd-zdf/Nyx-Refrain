@@ -75,7 +75,10 @@ mod tests {
     fn ring_moves_whole_frames_only() {
         let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(5);
         // Room for 5 samples but only 2 stereo frames: the half frame is dropped.
-        assert_eq!(push_frames(&mut producer, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2), 2);
+        assert_eq!(
+            push_frames(&mut producer, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2),
+            2
+        );
         let mut out = Vec::new();
         // Asking for 3 samples returns one whole frame.
         pop_frames(&mut consumer, 3, 2, &mut out);

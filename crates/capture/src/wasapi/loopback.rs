@@ -81,6 +81,7 @@ pub struct WasapiLoopbackSource {
     rebuild_sm: Arc<Mutex<RebuildStateMachine>>,
     drift_mapper: Arc<Mutex<QpcTimestampMapper>>,
     last_read_instant: Instant,
+    data_signal: Arc<crate::DataSignal>,
     stop_signal: Arc<AtomicBool>,
     thread_handle: Option<JoinHandle<()>>,
     is_started: bool,
@@ -134,6 +135,7 @@ impl WasapiLoopbackSource {
             format_info.sample_rate,
         )));
         let stop_signal = Arc::new(AtomicBool::new(false));
+        let data_signal = Arc::new(crate::DataSignal::default());
 
         // Spawn capture thread
         let thread_stop = stop_signal.clone();
@@ -142,6 +144,7 @@ impl WasapiLoopbackSource {
         let thread_discontinuity = discontinuity_tracker.clone();
         let thread_rebuild = rebuild_sm.clone();
         let thread_drift = drift_mapper.clone();
+        let thread_data = data_signal.clone();
 
         let thread_handle = std::thread::Builder::new()
             .name("wasapi-loopback-capture".into())
@@ -153,6 +156,7 @@ impl WasapiLoopbackSource {
                     thread_discontinuity,
                     thread_rebuild,
                     thread_drift,
+                    thread_data,
                     thread_stop,
                 );
             })?;
@@ -166,6 +170,7 @@ impl WasapiLoopbackSource {
             rebuild_sm,
             drift_mapper,
             last_read_instant: Instant::now(),
+            data_signal,
             stop_signal,
             thread_handle: Some(thread_handle),
             is_started: false,
@@ -225,6 +230,10 @@ impl WasapiLoopbackSource {
 impl AudioSource for WasapiLoopbackSource {
     fn is_live(&self) -> bool {
         true
+    }
+
+    fn data_signal(&self) -> Option<Arc<crate::DataSignal>> {
+        Some(self.data_signal.clone())
     }
 
     fn sample_rate(&self) -> u32 {
@@ -362,6 +371,7 @@ pub(crate) unsafe fn parse_format_from_pwfx(
 }
 
 /// Real-time capture loop running on dedicated OS thread with MMCSS "Pro Audio" priority.
+#[allow(clippy::too_many_arguments)]
 fn run_capture_loop(
     device_spec: DeviceSpec,
     enable_silence_keepalive: bool,
@@ -369,6 +379,7 @@ fn run_capture_loop(
     discontinuity_tracker: Arc<DiscontinuityTracker>,
     rebuild_sm: Arc<Mutex<RebuildStateMachine>>,
     drift_mapper: Arc<Mutex<QpcTimestampMapper>>,
+    data_signal: Arc<crate::DataSignal>,
     stop_signal: Arc<AtomicBool>,
 ) {
     let _com = match ComMtaGuard::new() {
@@ -492,6 +503,7 @@ fn run_capture_loop(
                             discontinuity_tracker
                                 .record_packet(FLAG_DATA_DISCONTINUITY, dropped / channels.max(1));
                         }
+                        data_signal.notify();
                     }
                 }
 
