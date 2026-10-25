@@ -51,6 +51,26 @@ pub struct PipelineMetricsTracker {
     packets_sent: AtomicU64,
     packets_dropped: AtomicU64,
     capture_discontinuities: AtomicU64,
+    glitches: [AtomicU64; 3],
+}
+
+/// Which audible gap a [`PipelineMetricsTracker::record_glitch`] call reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Glitch {
+    /// The sender had no packet ready when one was due and sent silence.
+    SenderStarved,
+    /// Chunks arrived with a gap (>= underrun timeout) between them; silence bridged it.
+    CaptureGap,
+    /// The source delivered nothing for the underrun timeout; a silent packet was queued.
+    SourceSilent,
+}
+
+/// Per-cause glitch totals; see [`Glitch`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GlitchCounts {
+    pub sender_starved: u64,
+    pub capture_gap: u64,
+    pub source_silent: u64,
 }
 
 impl PipelineMetricsTracker {
@@ -64,6 +84,7 @@ impl PipelineMetricsTracker {
             packets_sent: AtomicU64::new(0),
             packets_dropped: AtomicU64::new(0),
             capture_discontinuities: AtomicU64::new(0),
+            glitches: Default::default(),
         }
     }
 
@@ -99,6 +120,23 @@ impl PipelineMetricsTracker {
     #[inline]
     pub fn record_discontinuity(&self) {
         self.capture_discontinuities.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a discontinuity along with its cause.
+    #[inline]
+    pub fn record_glitch(&self, glitch: Glitch) {
+        self.record_discontinuity();
+        self.glitches[glitch as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Totals per glitch cause since the tracker was created.
+    pub fn glitch_counts(&self) -> GlitchCounts {
+        let get = |g: Glitch| self.glitches[g as usize].load(Ordering::Relaxed);
+        GlitchCounts {
+            sender_starved: get(Glitch::SenderStarved),
+            capture_gap: get(Glitch::CaptureGap),
+            source_silent: get(Glitch::SourceSilent),
+        }
     }
 
     /// Capture point-in-time snapshot.

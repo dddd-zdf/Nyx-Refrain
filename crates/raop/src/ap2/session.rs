@@ -138,6 +138,8 @@ pub struct Ap2Stats {
     pub retransmit_requests: AtomicU64,
     pub retransmit_served: AtomicU64,
     pub retransmit_missing: AtomicU64,
+    /// Largest delay (µs) past a packet's scheduled send time since last reset.
+    pub send_late_max_us: AtomicU64,
 }
 
 /// RTSP/HTTP connection that switches to HAP encryption after pairing.
@@ -987,6 +989,10 @@ impl Ap2Session {
                         if send_at > now {
                             pipeline::wait_until(send_at);
                         }
+                        let late = Instant::now().saturating_duration_since(send_at);
+                        stats
+                            .send_late_max_us
+                            .fetch_max(late.as_micros() as u64, Ordering::Relaxed);
                         source(&mut pcm);
                         guard.process_s16(&mut pcm);
                         for (i, s) in pcm.iter().enumerate() {
@@ -1067,7 +1073,7 @@ impl Ap2Session {
                 Ok(p) => *pcm = p,
                 Err(_) => {
                     pcm.fill(0);
-                    rt_metrics.record_discontinuity();
+                    rt_metrics.record_glitch(pipeline::Glitch::SenderStarved);
                 }
             }
             rt_metrics.record_packet_sent();

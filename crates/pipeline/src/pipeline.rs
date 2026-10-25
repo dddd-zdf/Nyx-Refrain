@@ -9,7 +9,7 @@ use capture::{AudioChunk, AudioSource};
 
 use crate::convert::{TpdfDither, downmix_to_stereo};
 use crate::drift::{DriftCompensator, DriftConfig};
-use crate::metrics::SharedPipelineMetrics;
+use crate::metrics::{Glitch, SharedPipelineMetrics};
 use crate::resample::{DEFAULT_RESAMPLER_CHUNK_FRAMES, ResamplePipeline};
 
 /// Number of frames per AirPlay audio packet.
@@ -104,7 +104,7 @@ impl PipelineProcessor {
         {
             let gap = now.duration_since(last_time);
             if gap >= self.underrun_timeout {
-                self.metrics.record_discontinuity();
+                self.metrics.record_glitch(Glitch::CaptureGap);
                 // Synthesize silence for the missing duration
                 let gap_frames =
                     ((gap.as_secs_f64() * self.source_sample_rate as f64) as usize).min(48000);
@@ -283,7 +283,7 @@ pub fn start_pipeline_feeder(
                     let current_fill = producer.slots();
                     let ring_fill = DEFAULT_RING_BUFFER_PACKETS.saturating_sub(current_fill);
                     metrics.set_buffer_fill(ring_fill);
-                    metrics.record_discontinuity();
+                    metrics.record_glitch(Glitch::SourceSilent);
 
                     let silence_pkt = [0i16; ALAC_PCM_SAMPLES];
                     let _ = producer.push(silence_pkt);

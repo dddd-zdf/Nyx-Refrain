@@ -469,6 +469,7 @@ fn run_capture_loop(
                 let mut mapped_flags = 0u32;
                 if (flags & (AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32)) != 0 {
                     mapped_flags |= FLAG_DATA_DISCONTINUITY;
+                    super::DIAG_WASAPI_GLITCHES.fetch_add(1, Ordering::Relaxed);
                 }
                 if (flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)) != 0 {
                     mapped_flags |= FLAG_SILENT;
@@ -499,6 +500,8 @@ fn run_capture_loop(
                         let channels = session.format_info.channels as usize;
                         let dropped = super::push_frames(&mut producer, &sample_buf, channels);
                         if dropped > 0 {
+                            super::DIAG_CAPTURE_OVERFLOW_FRAMES
+                                .fetch_add((dropped / channels.max(1)) as u64, Ordering::Relaxed);
                             // Ring buffer full; count once per block without blocking
                             discontinuity_tracker
                                 .record_packet(FLAG_DATA_DISCONTINUITY, dropped / channels.max(1));

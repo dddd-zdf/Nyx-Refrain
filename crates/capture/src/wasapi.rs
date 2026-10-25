@@ -19,6 +19,14 @@ pub use silence_stream::SilenceKeepAliveStream;
 
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 
+/// Packets Windows flagged as a break in the captured audio (`AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`),
+/// across all WASAPI sources; read by the audio watcher.
+pub static DIAG_WASAPI_GLITCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Captured frames dropped because the capture ring was full.
+pub static DIAG_CAPTURE_OVERFLOW_FRAMES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Writes as many whole frames of `samples` as fit into the capture ring in one block and
 /// returns the number of samples dropped. Per-sample pushes could split a frame when the ring
 /// filled, shifting every later frame by one channel.

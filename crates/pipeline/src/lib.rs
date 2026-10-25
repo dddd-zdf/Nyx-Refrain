@@ -13,7 +13,9 @@ pub mod timer;
 
 pub use convert::{TpdfDither, Xorshift64, downmix_to_stereo};
 pub use drift::{DriftCompensator, DriftConfig, MAX_DRIFT_CORRECTION_PPM};
-pub use metrics::{PipelineMetricsTracker, PipelineStatsSnapshot, SharedPipelineMetrics};
+pub use metrics::{
+    Glitch, GlitchCounts, PipelineMetricsTracker, PipelineStatsSnapshot, SharedPipelineMetrics,
+};
 pub use pipeline::{
     ALAC_FRAME_SAMPLES, ALAC_PCM_SAMPLES, DEFAULT_RING_BUFFER_PACKETS, DEFAULT_UNDERRUN_TIMEOUT_MS,
     PipelineProcessor, start_pipeline_feeder,
