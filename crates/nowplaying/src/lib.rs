@@ -1023,13 +1023,16 @@ mod win {
             }
             let wait = next_poll.saturating_duration_since(Instant::now());
             let command = match &rt {
-                Some(rt) => match rt.block_on(tokio::time::timeout(wait, commands.recv())) {
-                    Ok(Some(command)) => Some(command),
-                    // The watcher was dropped.
-                    Ok(None) => break,
-                    // The next poll is due.
-                    Err(_) => None,
-                },
+                // The timeout must be created inside the runtime, hence the async block.
+                Some(rt) => {
+                    match rt.block_on(async { tokio::time::timeout(wait, commands.recv()).await }) {
+                        Ok(Some(command)) => Some(command),
+                        // The watcher was dropped.
+                        Ok(None) => break,
+                        // The next poll is due.
+                        Err(_) => None,
+                    }
+                }
                 None => {
                     std::thread::sleep(wait.min(Duration::from_millis(50)));
                     commands.try_recv().ok()
