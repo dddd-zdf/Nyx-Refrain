@@ -27,7 +27,7 @@ const LEGEND: &str = "\
 # win_burst  frames Windows handed over in one capture wake-up (480 = one 10 ms packet)
 # win_gap    time between capture wake-ups (about 10 ms is normal)
 # feed_gap   time between feeder reads that got audio (about 10 ms is normal)
-# ring_peak  packets queued when the sender took one (above 6 means a trim)";
+# ring_peak  packets queued when the sender took one (above 8 means a trim)";
 
 #[derive(Clone, Copy, Default)]
 struct Counts {

@@ -102,9 +102,11 @@ pub struct Ap2Config {
 }
 
 /// For live sources, packets buffered between capture pipeline and sender beyond this are
-/// dropped (6 packets ≈ 48 ms; the pipeline steers the fill to 3, WASAPI delivers ~10 ms
-/// chunks ≈ 1.25 packets, so normal peaks stay below the cap).
-pub const LIVE_MAX_BUFFERED_PACKETS: usize = 6;
+/// dropped (8 packets ≈ 64 ms). The pipeline steers the fill to 3 and WASAPI delivers ~10 ms
+/// chunks ≈ 1.25 packets, yet measured peaks reach 5–6, and a drift-estimate swing then
+/// tipped a cap of 6 into dropping a packet (an audible click) about once a minute. Steady
+/// latency follows the fill target, not this cap.
+pub const LIVE_MAX_BUFFERED_PACKETS: usize = 8;
 
 /// Lowest sync latency accepted (verified clean in receiver testing).
 pub const MIN_SYNC_LATENCY_MS: i32 = -165;
