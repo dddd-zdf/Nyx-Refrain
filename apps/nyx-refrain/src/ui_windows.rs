@@ -2,6 +2,7 @@
 #![cfg(windows)]
 
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1405,21 +1406,34 @@ impl Shell {
             return Ok(());
         }
         let size = state.window.inner_size();
-        if (show || state.window.is_visible() == Some(true))
+        let visible = show || state.window.is_visible() == Some(true);
+        let full = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(size.width as f32, size.height as f32),
+        );
+        // Only the area that changed since the last presented frame is redrawn: each pixel
+        // costs real CPU time, and a hover usually changes one small widget.
+        let region = match &state.painted {
+            Some((shapes, ppp, sz))
+                if !force
+                    && !show
+                    && !textures_changed
+                    && *ppp == output.pixels_per_point
+                    && *sz == [size.width, size.height] =>
+            {
+                changed_area(shapes, &output.shapes).map_or(full, |area| {
+                    let area = (area * *ppp).expand(2.0);
+                    egui::Rect::from_min_max(area.min.floor(), area.max.ceil()).intersect(full)
+                })
+            }
+            _ => full,
+        };
+        if visible
+            && !region.is_negative()
             && let (Some(width), Some(height)) = (
                 std::num::NonZeroU32::new(size.width),
                 std::num::NonZeroU32::new(size.height),
             )
-            && (force
-                || show
-                || textures_changed
-                || !state.painted.as_ref().is_some_and(|(shapes, ppp, sz)| {
-                    // Most pointer moves and repaint requests change nothing on screen, and
-                    // each CPU-rendered frame redraws every pixel of the window.
-                    *ppp == output.pixels_per_point
-                        && *sz == [size.width, size.height]
-                        && *shapes == output.shapes
-                }))
         {
             state
                 .surface
@@ -1432,21 +1446,32 @@ impl Shell {
                 .surface
                 .buffer_mut()
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            // The buffer keeps the previous frame only once it has been presented.
+            let region = if buffer.age() == 0 { full } else { region };
             state.renderer.paint(
                 &primitives,
                 output.pixels_per_point,
                 [size.width as usize, size.height as usize],
                 // Match eframe's clear color behind the rounded egui panel.
                 egui::Color32::from_rgba_unmultiplied(12, 12, 12, 180),
+                region,
                 &mut buffer,
             );
-            buffer.present().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let damage = softbuffer::Rect {
+                x: region.min.x as u32,
+                y: region.min.y as u32,
+                width: NonZeroU32::new(region.width() as u32).unwrap_or(width),
+                height: NonZeroU32::new(region.height() as u32).unwrap_or(height),
+            };
+            buffer
+                .present_with_damage(&[damage])
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             state.painted = Some((
                 output.shapes,
                 output.pixels_per_point,
                 [size.width, size.height],
             ));
-        } else if state.window.is_visible() != Some(true) {
+        } else if !visible {
             state.painted = None;
         }
         state.renderer.free_textures(&mut output.textures_delta);
@@ -1470,6 +1495,26 @@ impl Shell {
         self.error = Some(error);
         event_loop.exit();
     }
+}
+
+/// Area (in points) where `next` differs from `prev`, or `None` when the frames can't be
+/// compared shape by shape (a shape was added or removed). Negative when nothing changed.
+fn changed_area(
+    prev: &[egui::epaint::ClippedShape],
+    next: &[egui::epaint::ClippedShape],
+) -> Option<egui::Rect> {
+    if prev.len() != next.len() {
+        return None;
+    }
+    let mut area = egui::Rect::NOTHING;
+    for (a, b) in prev.iter().zip(next) {
+        if a != b {
+            for s in [a, b] {
+                area = area.union(s.shape.visual_bounding_rect().intersect(s.clip_rect));
+            }
+        }
+    }
+    Some(area)
 }
 
 impl winit::application::ApplicationHandler<Repaint> for Shell {
