@@ -274,13 +274,7 @@ impl AudioSource for ProcessLoopbackSource {
 
         let max_samples = max_frames * channels;
         let mut samples = Vec::with_capacity(max_samples);
-
-        while samples.len() < max_samples {
-            match self.consumer.pop() {
-                Ok(sample) => samples.push(sample),
-                Err(rtrb::PopError::Empty) => break,
-            }
-        }
+        super::pop_frames(&mut self.consumer, max_samples, channels, &mut samples);
 
         if samples.is_empty() {
             // No captured data right now (WASAPI delivers every ~10 ms). Report "nothing yet"
@@ -525,10 +519,11 @@ fn run_process_capture_loop(
                         )
                         .is_ok()
                     {
-                        for &sample in &sample_buf {
-                            if producer.push(sample).is_err() {
-                                discontinuity_tracker.record_packet(FLAG_DATA_DISCONTINUITY, 1);
-                            }
+                        let channels = format_info.channels as usize;
+                        let dropped = super::push_frames(&mut producer, &sample_buf, channels);
+                        if dropped > 0 {
+                            discontinuity_tracker
+                                .record_packet(FLAG_DATA_DISCONTINUITY, dropped / channels.max(1));
                         }
                     }
                 }
