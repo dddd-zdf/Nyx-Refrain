@@ -85,6 +85,12 @@ pub struct Settings {
     pub send_now_playing: bool,
     pub remote_control: bool,
     pub capture_mode: CaptureMode,
+    /// Windows: mute this PC's speakers while streaming (per-process capture only), so the
+    /// receiver's delayed copy doesn't play alongside them.
+    pub mute_local: bool,
+    /// Windows: the speakers are muted by us, not the user. Lets a later run unmute them when
+    /// the app exited without doing so (logout, crash).
+    pub local_muted: bool,
     /// Reconnect to the saved device on launch if the app last exited while streaming.
     pub resume_on_launch: bool,
     /// Whether streaming was left on: set by Start, cleared only by an explicit Stop (quitting,
@@ -104,6 +110,8 @@ impl Default for Settings {
             send_now_playing: true,
             remote_control: true,
             capture_mode: CaptureMode::Process,
+            mute_local: true,
+            local_muted: false,
             resume_on_launch: true,
             was_streaming: false,
         }
@@ -156,6 +164,8 @@ mod tests {
             send_now_playing: false,
             remote_control: false,
             capture_mode: CaptureMode::Endpoint,
+            mute_local: false,
+            local_muted: true,
             resume_on_launch: false,
             was_streaming: true,
         };
@@ -174,6 +184,8 @@ mod tests {
         assert!(!back.send_now_playing);
         assert!(!back.remote_control);
         assert_eq!(back.capture_mode, CaptureMode::Endpoint);
+        assert!(!back.mute_local);
+        assert!(back.local_muted);
         assert!(!back.resume_on_launch);
         assert!(back.was_streaming);
 
@@ -185,6 +197,8 @@ mod tests {
         assert!(partial.send_now_playing);
         assert!(partial.remote_control);
         assert_eq!(partial.capture_mode, CaptureMode::Process);
+        assert!(partial.mute_local);
+        assert!(!partial.local_muted);
         assert!(partial.resume_on_launch);
         assert!(!partial.was_streaming);
 

@@ -38,6 +38,8 @@ pub struct StartParams {
     pub send_now_playing: bool,
     pub remote_control: bool,
     pub capture_mode: crate::settings::CaptureMode,
+    /// Mute this PC's speakers while streaming (Windows, per-process capture only).
+    pub mute_local: bool,
 }
 
 pub enum Cmd {
@@ -52,6 +54,7 @@ pub enum Cmd {
     SetVolume(f32),
     SetSendNowPlaying(bool),
     SetRemoteControl(bool),
+    SetMuteLocal(bool),
     Discover,
     CheckFirewall,
     #[allow(dead_code)]
@@ -259,6 +262,7 @@ fn resume_params(
         send_now_playing: s.send_now_playing,
         remote_control: s.remote_control,
         capture_mode: s.capture_mode,
+        mute_local: s.mute_local,
     })
 }
 
@@ -312,16 +316,60 @@ fn remember_streaming(settings: &Option<Arc<Mutex<crate::settings::Settings>>>, 
     }
 }
 
+#[cfg(windows)]
+type LocalMute = capture::wasapi::EndpointMuteGuard;
+#[cfg(not(windows))]
+type LocalMute = ();
+
+/// Mutes this PC's speakers (`want`) or unmutes them if we muted them, also when an earlier
+/// run muted them and exited without unmuting ([`Settings::local_muted`]). Speakers the user
+/// muted are left alone.
+///
+/// [`Settings::local_muted`]: crate::settings::Settings::local_muted
+fn set_local_mute(
+    mute: &mut Option<LocalMute>,
+    want: bool,
+    settings: &Option<Arc<Mutex<crate::settings::Settings>>>,
+) {
+    #[cfg(windows)]
+    {
+        let left_muted = settings
+            .as_ref()
+            .and_then(|s| s.lock().ok().map(|s| s.local_muted))
+            .unwrap_or(false);
+        if mute.is_none() && (want || left_muted) {
+            match LocalMute::mute_default(left_muted) {
+                Ok(g) => *mute = g,
+                Err(e) => tracing_like_warn(&format!("muting the speakers failed: {e}")),
+            }
+        }
+        if !want {
+            *mute = None;
+        }
+        if let Some(s) = settings
+            && let Ok(mut s) = s.lock()
+            && s.local_muted != mute.is_some()
+        {
+            s.local_muted = mute.is_some();
+            s.save();
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (mute, want, settings);
+}
+
 #[cfg(target_os = "linux")]
 type SinkVol = capture::pipewire::SinkVolume;
 #[cfg(not(target_os = "linux"))]
 type SinkVol = ();
 
+/// Also returns whether the source captures before the speakers (process loopback), so
+/// muting them leaves the stream untouched.
 #[cfg(windows)]
 fn make_source(
     _initial_volume_pct: f32,
     capture_mode: crate::settings::CaptureMode,
-) -> anyhow::Result<(Box<dyn capture::AudioSource + Send>, Option<()>)> {
+) -> anyhow::Result<(Box<dyn capture::AudioSource + Send>, bool)> {
     use capture::wasapi::{
         ProcessLoopbackConfig, ProcessLoopbackMode, ProcessLoopbackSource, WasapiLoopbackSource,
     };
@@ -334,7 +382,7 @@ fn make_source(
             match ProcessLoopbackSource::with_config(config) {
                 Ok(src) => {
                     eprintln!("nyx-refrain: capturing via WASAPI process loopback");
-                    Ok((Box::new(src), None))
+                    Ok((Box::new(src), true))
                 }
                 Err(e) => {
                     tracing_like_warn(&format!(
@@ -342,7 +390,7 @@ fn make_source(
                     ));
                     let src = WasapiLoopbackSource::with_config(Default::default())
                         .map_err(|e| anyhow::anyhow!("WASAPI endpoint loopback: {e}"))?;
-                    Ok((Box::new(src), None))
+                    Ok((Box::new(src), false))
                 }
             }
         }
@@ -350,7 +398,7 @@ fn make_source(
             let src = WasapiLoopbackSource::with_config(Default::default())
                 .map_err(|e| anyhow::anyhow!("WASAPI endpoint loopback: {e}"))?;
             eprintln!("nyx-refrain: capturing via WASAPI endpoint loopback");
-            Ok((Box::new(src), None))
+            Ok((Box::new(src), false))
         }
     }
 }
@@ -380,13 +428,13 @@ fn make_source(
 fn make_source(
     _initial_volume_pct: f32,
     _capture_mode: crate::settings::CaptureMode,
-) -> anyhow::Result<(Box<dyn capture::AudioSource + Send>, Option<()>)> {
+) -> anyhow::Result<(Box<dyn capture::AudioSource + Send>, bool)> {
     // Development stand-in on other platforms: a quiet 440 Hz tone.
     Ok((
         Box::new(capture::sources::sine::SineSource::new(
             440.0, -30.0, 44_100, 2,
         )),
-        None,
+        false,
     ))
 }
 
@@ -469,6 +517,8 @@ struct Running {
     _now_playing_watcher: Option<nowplaying::NowPlayingWatcher>,
     /// Forward receiver playback commands to the now-playing session (needs the watcher).
     remote_control: bool,
+    /// Muting this PC's speakers leaves the capture untouched (see [`make_source`]).
+    local_mute_ok: bool,
     #[cfg(target_os = "linux")]
     capture: Capture,
 }
@@ -498,6 +548,7 @@ async fn run(
     let mut remote_rx: Option<mpsc::Receiver<raop::ap2::remote::Command>> = None;
     let mut last_sent_track: Option<nowplaying::NowPlaying> = None;
     let mut settings_ref: Option<Arc<Mutex<crate::settings::Settings>>> = None;
+    let mut local_mute: Option<LocalMute> = None;
     #[cfg(target_os = "linux")]
     let mut last_receiver_vol: Option<f32> = None;
     let mut feedback = tokio::time::interval(Duration::from_secs(2));
@@ -534,6 +585,9 @@ async fn run(
                         if wants_resume && running.is_none() && resume.is_none() {
                             resume = Some(Resume::new(Instant::now()));
                             set_state(&shared, &*notifier, State::Connecting);
+                        } else if running.is_none() {
+                            // Not resuming: unmute speakers an earlier run left muted.
+                            set_local_mute(&mut local_mute, false, &settings_ref);
                         }
                     }
                     Cmd::Start(p) => {
@@ -597,6 +651,11 @@ async fn run(
                                 }
                                 now_playing_rx = np_rx;
                                 remote_rx = r_rx;
+                                set_local_mute(
+                                    &mut local_mute,
+                                    p.mute_local && r.local_mute_ok,
+                                    &settings_ref,
+                                );
                                 running = Some(r);
                                 resume = None;
                                 set_state(&shared, &*notifier, State::Streaming);
@@ -609,6 +668,7 @@ async fn run(
                                 }
                                 _ => {
                                     kept = None;
+                                    set_local_mute(&mut local_mute, false, &settings_ref);
                                     set_state(&shared, &*notifier, State::Error(e));
                                 }
                             },
@@ -619,6 +679,8 @@ async fn run(
                             remember_streaming(&settings_ref, false);
                         }
                         resume = None;
+                        // First: quitting waits only briefly for the engine.
+                        set_local_mute(&mut local_mute, false, &settings_ref);
                         if let Some(r) = running.take() {
                             r.stop().await;
                         }
@@ -689,6 +751,14 @@ async fn run(
                             r.remote_control = enabled;
                         }
                     }
+                    Cmd::SetMuteLocal(enabled) => {
+                        if let Some(r) = running.as_mut() {
+                            r.params.mute_local = enabled;
+                            set_local_mute(&mut local_mute, enabled && r.local_mute_ok, &settings_ref);
+                        } else if !enabled {
+                            set_local_mute(&mut local_mute, false, &settings_ref);
+                        }
+                    }
                     Cmd::SetVolume(pct) => {
                         if let Some(r) = running.as_mut() {
                             let result = r.session.set_volume(pct_to_db(pct)).await;
@@ -753,6 +823,7 @@ async fn run(
                         });
                         resume = None;
                         kept = None;
+                        set_local_mute(&mut local_mute, false, &settings_ref);
                         set_state(&shared, &*notifier, State::Error(e));
                     } else if now >= r.next_attempt {
                         let settings = settings_ref
@@ -763,9 +834,10 @@ async fn run(
                             .map(|g| (g.devices.clone(), g.discovering))
                             .unwrap_or_default();
                         let params = match &r.retry {
-                            // Reconnect to the same receiver, with the current volume.
+                            // Reconnect to the same receiver, with the current settings.
                             Some(p) => Some(StartParams {
-                                volume_pct: settings.map_or(p.volume_pct, |s| s.volume_pct),
+                                volume_pct: settings.as_ref().map_or(p.volume_pct, |s| s.volume_pct),
+                                mute_local: settings.as_ref().map_or(p.mute_local, |s| s.mute_local),
                                 ..p.clone()
                             }),
                             None => settings.and_then(|s| {
@@ -954,6 +1026,7 @@ async fn run(
             }
         }
     }
+    set_local_mute(&mut local_mute, false, &settings_ref);
     if let Some(r) = running.take() {
         r.stop().await;
     }
@@ -1021,11 +1094,14 @@ async fn start(
     #[cfg(target_os = "linux")]
     let source: Box<dyn capture::AudioSource + Send> = Box::new(capture.source.clone());
     #[cfg(not(target_os = "linux"))]
-    let (source, _) = {
+    let (source, local_mute_ok) = {
         let _ = kept;
         make_source(p.volume_pct, p.capture_mode)
             .map_err(|e| EngineError::Capture(e.to_string()))?
     };
+    // The virtual sink is the default output already, so the speakers play nothing.
+    #[cfg(target_os = "linux")]
+    let local_mute_ok = false;
     let ring = pipeline::DEFAULT_RING_BUFFER_PACKETS;
     let metrics: pipeline::SharedPipelineMetrics =
         Arc::new(pipeline::PipelineMetricsTracker::new(ring));
@@ -1051,6 +1127,7 @@ async fn start(
                 send_now_playing: p.send_now_playing,
                 _now_playing_watcher: watcher,
                 remote_control: p.remote_control,
+                local_mute_ok,
                 #[cfg(target_os = "linux")]
                 capture,
             };

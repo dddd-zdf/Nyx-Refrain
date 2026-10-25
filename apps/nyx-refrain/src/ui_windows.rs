@@ -413,6 +413,23 @@ impl App {
                                     self.engine.send(Cmd::Start(p));
                                 }
                             }
+
+                            // Device loopback captures after the speakers: muting them would
+                            // mute the stream.
+                            let mut mute_local = settings.mute_local;
+                            if ui
+                                .add_enabled(
+                                    settings.capture_mode == CaptureMode::Process,
+                                    egui::Checkbox::new(&mut mute_local, t(lang, Key::MuteLocal)),
+                                )
+                                .on_hover_text(t(lang, Key::MuteLocalHint))
+                                .on_disabled_hover_text(t(lang, Key::MuteLocalHint))
+                                .changed()
+                            {
+                                settings.mute_local = mute_local;
+                                settings_changed = true;
+                                self.engine.send(Cmd::SetMuteLocal(mute_local));
+                            }
                         });
                     });
                 });
@@ -1562,6 +1579,15 @@ pub fn run() -> anyhow::Result<()> {
         error: None,
     };
     event_loop.run_app(&mut shell)?;
+    // Quit sent Shutdown: give the engine a moment to unmute the speakers and stop.
+    if let Some(state) = &shell.state {
+        let since = Instant::now();
+        while state.app.engine.snapshot().state != State::Idle
+            && since.elapsed() < Duration::from_secs(2)
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
     shell.error.map_or(Ok(()), Err)
 }
 
