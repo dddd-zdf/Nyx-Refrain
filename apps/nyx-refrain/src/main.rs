@@ -1,6 +1,7 @@
 //! Nyx Refrain tray GUI front-end entry point.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod audio_watch;
 mod autostart;
 mod engine;
 mod i18n;

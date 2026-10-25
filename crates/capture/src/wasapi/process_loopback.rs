@@ -473,6 +473,7 @@ fn run_process_capture_loop(
         let _ = audio_client.Start();
         debug!("Process loopback capture streaming started");
 
+        let mut wake = super::WakeDiag::default();
         let mut sample_buf = Vec::<f32>::with_capacity(4096);
 
         while !stop_signal.load(Ordering::Relaxed) {
@@ -480,6 +481,7 @@ fn run_process_capture_loop(
             if wait_res.0 != 0 {
                 continue;
             }
+            wake.woke();
 
             while let Ok(packet_size) = capture_client.GetNextPacketSize() {
                 if packet_size == 0 {
@@ -502,10 +504,12 @@ fn run_process_capture_loop(
                 if hr.is_err() {
                     break;
                 }
+                wake.frames(num_frames);
 
                 let mut mapped_flags = 0u32;
                 if (flags & (AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32)) != 0 {
                     mapped_flags |= FLAG_DATA_DISCONTINUITY;
+                    super::DIAG_WASAPI_GLITCHES.fetch_add(1, Ordering::Relaxed);
                 }
                 if (flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)) != 0 {
                     mapped_flags |= FLAG_SILENT;
@@ -532,6 +536,8 @@ fn run_process_capture_loop(
                         let channels = format_info.channels as usize;
                         let dropped = super::push_frames(&mut producer, &sample_buf, channels);
                         if dropped > 0 {
+                            super::DIAG_CAPTURE_OVERFLOW_FRAMES
+                                .fetch_add((dropped / channels.max(1)) as u64, Ordering::Relaxed);
                             discontinuity_tracker
                                 .record_packet(FLAG_DATA_DISCONTINUITY, dropped / channels.max(1));
                         }
@@ -541,6 +547,7 @@ fn run_process_capture_loop(
 
                 let _ = capture_client.ReleaseBuffer(num_frames);
             }
+            wake.done();
         }
 
         let _ = audio_client.Stop();

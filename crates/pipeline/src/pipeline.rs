@@ -9,7 +9,7 @@ use capture::{AudioChunk, AudioSource};
 
 use crate::convert::{TpdfDither, downmix_to_stereo};
 use crate::drift::{DriftCompensator, DriftConfig};
-use crate::metrics::SharedPipelineMetrics;
+use crate::metrics::{Glitch, SharedPipelineMetrics};
 use crate::resample::{DEFAULT_RESAMPLER_CHUNK_FRAMES, ResamplePipeline};
 
 /// Number of frames per AirPlay audio packet.
@@ -25,7 +25,7 @@ pub const DEFAULT_UNDERRUN_TIMEOUT_MS: u64 = 50;
 pub const DEFAULT_RING_BUFFER_PACKETS: usize = 32;
 
 /// Target ring fill (packets) for live sources; must stay well below the sender's backlog cap
-/// (`raop::ap2::session::LIVE_MAX_BUFFERED_PACKETS` = 6) so chunk-granularity peaks never trim.
+/// (`raop::ap2::session::LIVE_MAX_BUFFERED_PACKETS` = 8) so chunk-granularity peaks never trim.
 pub const LIVE_TARGET_FILL_PACKETS: usize = 3;
 
 /// Core processing engine that converts, resamples, compensates drift, dithers,
@@ -34,6 +34,8 @@ pub struct PipelineProcessor {
     source_sample_rate: u32,
     resampler: ResamplePipeline,
     drift: DriftCompensator,
+    /// Steer the queue fill (live sources); paced sources keep the nominal ratio.
+    steer: bool,
     dither: TpdfDither,
     underrun_timeout: Duration,
     last_chunk_time: Option<Instant>,
@@ -44,10 +46,22 @@ pub struct PipelineProcessor {
 }
 
 impl PipelineProcessor {
-    /// Create a new PipelineProcessor for given source sample rate.
-    /// See [`DriftCompensator::set_target_fill_level`].
+    /// Steers the queue towards `packets` (live sources). Without this the processor keeps
+    /// the nominal ratio: back-pressured sources hold the queue full, so there is no clock
+    /// difference to correct. See [`DriftCompensator::set_target_fill_level`].
     pub fn set_target_fill_level(&mut self, packets: usize) {
         self.drift.set_target_fill_level(packets);
+        self.steer = true;
+    }
+
+    /// Fill level (packets) to top the queue up to after the sender ran dry, when steering.
+    pub fn refill_target(&self) -> Option<usize> {
+        self.steer.then(|| self.drift.target_fill_level())
+    }
+
+    /// Tells the drift controller the queue was just topped up to `fill` packets.
+    pub fn refilled(&mut self, fill: usize) {
+        self.drift.refilled(fill);
     }
 
     pub fn new(
@@ -66,6 +80,7 @@ impl PipelineProcessor {
             source_sample_rate,
             resampler,
             drift,
+            steer: false,
             dither: TpdfDither::default(),
             underrun_timeout: underrun_timeout
                 .unwrap_or(Duration::from_millis(DEFAULT_UNDERRUN_TIMEOUT_MS)),
@@ -104,7 +119,7 @@ impl PipelineProcessor {
         {
             let gap = now.duration_since(last_time);
             if gap >= self.underrun_timeout {
-                self.metrics.record_discontinuity();
+                self.metrics.record_glitch(Glitch::CaptureGap);
                 // Synthesize silence for the missing duration
                 let gap_frames =
                     ((gap.as_secs_f64() * self.source_sample_rate as f64) as usize).min(48000);
@@ -121,13 +136,12 @@ impl PipelineProcessor {
         downmix_to_stereo(&chunk.data, chunk.channels, &mut downmix);
 
         // 2. Clock drift compensation
-        let dt = Duration::from_millis(10); // nominal chunk interval
-        let corr_ppm = self.drift.compute_correction(
-            chunk.frame_count(),
-            chunk.timestamp,
-            current_fill_packets,
-            dt,
-        );
+        let corr_ppm = if self.steer {
+            self.drift
+                .compute_correction(chunk.frame_count(), current_fill_packets)
+        } else {
+            0.0
+        };
         let rel_ratio = DriftCompensator::ppm_to_relative_ratio(corr_ppm);
         self.resampler.set_relative_ratio(rel_ratio)?;
         self.metrics
@@ -228,7 +242,7 @@ pub fn start_pipeline_feeder(
             };
 
             if source.is_live() {
-                // Live capture: the sender trims above 6 packets, so steer to 3.
+                // Live capture: the sender trims above 8 packets, so steer to 3.
                 processor.set_target_fill_level(LIVE_TARGET_FILL_PACKETS);
             }
             let _ = source.start();
@@ -237,6 +251,7 @@ pub fn start_pipeline_feeder(
             let data_signal = source.data_signal();
             let mut packets_batch = Vec::with_capacity(8);
             let mut last_activity = Instant::now();
+            let mut starved_seen = metrics.glitch_counts().sender_starved;
 
             // Calculate chunk size for ~10 ms reads
             let read_frames = (sample_rate / 100).max(128) as usize;
@@ -245,10 +260,29 @@ pub fn start_pipeline_feeder(
                 let mut idle = false;
                 match source.read_chunk(read_frames) {
                     Ok(Some(chunk)) => {
+                        metrics.record_feeder_gap(last_activity.elapsed());
                         last_activity = Instant::now();
                         packets_batch.clear();
                         let current_fill = producer.slots(); // capacity - slots = fill
-                        let ring_fill = DEFAULT_RING_BUFFER_PACKETS.saturating_sub(current_fill);
+                        let mut ring_fill =
+                            DEFAULT_RING_BUFFER_PACKETS.saturating_sub(current_fill);
+
+                        let starved = metrics.glitch_counts().sender_starved;
+                        if starved != starved_seen {
+                            starved_seen = starved;
+                            // The sender just ran dry and sent silence. Top the queue back up
+                            // to the target in one step (stretching that silence by a few ms)
+                            // rather than steering up over ~50 s, during which every timing
+                            // bump would leave another gap.
+                            if let Some(target) = processor.refill_target() {
+                                while ring_fill < target
+                                    && producer.push([0i16; ALAC_PCM_SAMPLES]).is_ok()
+                                {
+                                    ring_fill += 1;
+                                }
+                                processor.refilled(ring_fill);
+                            }
+                        }
                         metrics.set_buffer_fill(ring_fill);
 
                         if let Ok(()) =
@@ -283,7 +317,7 @@ pub fn start_pipeline_feeder(
                     let current_fill = producer.slots();
                     let ring_fill = DEFAULT_RING_BUFFER_PACKETS.saturating_sub(current_fill);
                     metrics.set_buffer_fill(ring_fill);
-                    metrics.record_discontinuity();
+                    metrics.record_glitch(Glitch::SourceSilent);
 
                     let silence_pkt = [0i16; ALAC_PCM_SAMPLES];
                     let _ = producer.push(silence_pkt);

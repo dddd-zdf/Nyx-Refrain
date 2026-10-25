@@ -398,6 +398,7 @@ fn run_capture_loop(
         NotificationRegistration::register(enumerator, device_change_flag.clone()).ok()
     });
 
+    let mut wake = super::WakeDiag::default();
     let mut sample_buf = Vec::<f32>::with_capacity(4096);
 
     while !stop_signal.load(Ordering::Relaxed) {
@@ -439,6 +440,7 @@ fn run_capture_loop(
                 // Timeout or failure; continue
                 continue;
             }
+            wake.woke();
 
             // Process all pending packets
             while let Ok(packet_size) = unsafe { session.capture_client.GetNextPacketSize() } {
@@ -464,11 +466,13 @@ fn run_capture_loop(
                 if hr.is_err() {
                     break;
                 }
+                wake.frames(num_frames);
 
                 // Discontinuity accounting
                 let mut mapped_flags = 0u32;
                 if (flags & (AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32)) != 0 {
                     mapped_flags |= FLAG_DATA_DISCONTINUITY;
+                    super::DIAG_WASAPI_GLITCHES.fetch_add(1, Ordering::Relaxed);
                 }
                 if (flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)) != 0 {
                     mapped_flags |= FLAG_SILENT;
@@ -499,6 +503,8 @@ fn run_capture_loop(
                         let channels = session.format_info.channels as usize;
                         let dropped = super::push_frames(&mut producer, &sample_buf, channels);
                         if dropped > 0 {
+                            super::DIAG_CAPTURE_OVERFLOW_FRAMES
+                                .fetch_add((dropped / channels.max(1)) as u64, Ordering::Relaxed);
                             // Ring buffer full; count once per block without blocking
                             discontinuity_tracker
                                 .record_packet(FLAG_DATA_DISCONTINUITY, dropped / channels.max(1));
@@ -516,6 +522,7 @@ fn run_capture_loop(
                     let _ = session.capture_client.ReleaseBuffer(num_frames);
                 }
             }
+            wake.done();
         }
 
         // Clean up current session before loop iteration / rebuild

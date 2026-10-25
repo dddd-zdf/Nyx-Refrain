@@ -102,9 +102,11 @@ pub struct Ap2Config {
 }
 
 /// For live sources, packets buffered between capture pipeline and sender beyond this are
-/// dropped (6 packets ≈ 48 ms; the pipeline steers the fill to 3, WASAPI delivers ~10 ms
-/// chunks ≈ 1.25 packets, so normal peaks stay below the cap).
-pub const LIVE_MAX_BUFFERED_PACKETS: usize = 6;
+/// dropped (8 packets ≈ 64 ms). The pipeline steers the fill to 3 and WASAPI delivers ~10 ms
+/// chunks ≈ 1.25 packets, yet measured peaks reach 5–6, and a drift-estimate swing then
+/// tipped a cap of 6 into dropping a packet (an audible click) about once a minute. Steady
+/// latency follows the fill target, not this cap.
+pub const LIVE_MAX_BUFFERED_PACKETS: usize = 8;
 
 /// Lowest sync latency accepted (verified clean in receiver testing).
 pub const MIN_SYNC_LATENCY_MS: i32 = -165;
@@ -138,6 +140,8 @@ pub struct Ap2Stats {
     pub retransmit_requests: AtomicU64,
     pub retransmit_served: AtomicU64,
     pub retransmit_missing: AtomicU64,
+    /// Largest delay (µs) past a packet's scheduled send time since last reset.
+    pub send_late_max_us: AtomicU64,
 }
 
 /// RTSP/HTTP connection that switches to HAP encryption after pairing.
@@ -154,6 +158,16 @@ struct Conn {
 /// How long a metadata `SET_PARAMETER` may wait for its response before that kind of
 /// metadata is disabled for the session.
 const METADATA_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long the keep-alive and volume requests wait for the receiver. The engine awaits them
+/// in its command loop, so an unbounded wait on a receiver that stopped answering (heavy
+/// Wi-Fi loss) froze the app: no reconnect, and Stop did nothing. A timed-out keep-alive
+/// fails the session, which the engine then reconnects.
+const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long [`Ap2Session::stop`] waits for the TEARDOWN response; the session is closed
+/// either way, so this only keeps Stop from feeling stuck.
+const TEARDOWN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl Conn {
     fn log(&mut self, dir: &str, text: &[u8]) {
@@ -987,6 +1001,10 @@ impl Ap2Session {
                         if send_at > now {
                             pipeline::wait_until(send_at);
                         }
+                        let late = Instant::now().saturating_duration_since(send_at);
+                        stats
+                            .send_late_max_us
+                            .fetch_max(late.as_micros() as u64, Ordering::Relaxed);
                         source(&mut pcm);
                         guard.process_s16(&mut pcm);
                         for (i, s) in pcm.iter().enumerate() {
@@ -1051,6 +1069,7 @@ impl Ap2Session {
         let rt_metrics = metrics.clone();
         let live = source_is_live;
         let started = Self::start(cfg, move |pcm: &mut [i16; SAMPLES_PER_PACKET]| {
+            rt_metrics.record_ring_peak(consumer.slots());
             if live {
                 // Keep latency bounded: drop backlog beyond a few packets (see
                 // AudioSource::is_live). No allocation, no locks.
@@ -1067,7 +1086,7 @@ impl Ap2Session {
                 Ok(p) => *pcm = p,
                 Err(_) => {
                     pcm.fill(0);
-                    rt_metrics.record_discontinuity();
+                    rt_metrics.record_glitch(pipeline::Glitch::SenderStarved);
                 }
             }
             rt_metrics.record_packet_sent();
@@ -1118,22 +1137,24 @@ impl Ap2Session {
         let uri = self.uri.clone();
         let body = format!("volume: {:.1}", volume_db.clamp(-144.0, 0.0)).into_bytes();
         self.conn
-            .request(
-                false,
+            .request_bounded(
                 "SET_PARAMETER",
                 &uri,
                 &[],
                 Some(("text/parameters", body)),
+                CONTROL_RESPONSE_TIMEOUT,
             )
             .await
+            .map_err(|_| Ap2Error::Rtsp("timed out waiting for volume response".into()))?
             .map(|_| ())
     }
 
     /// Sends `POST /feedback` (keep-alive, pyatv every 2 s).
     pub async fn feedback(&mut self) -> Result<(), Ap2Error> {
         self.conn
-            .request(false, "POST", "/feedback", &[], None)
+            .request_bounded("POST", "/feedback", &[], None, CONTROL_RESPONSE_TIMEOUT)
             .await
+            .map_err(|_| Ap2Error::Rtsp("timed out waiting for feedback response".into()))?
             .map(|_| ())
     }
 
@@ -1388,12 +1409,20 @@ impl Ap2Session {
             let _ = t.join();
         }
         let uri = self.uri.clone();
-        if let Err(e) = self
+        match self
             .conn
-            .request(false, "TEARDOWN", &uri, &[("Session", "0".into())], None)
+            .request_bounded(
+                "TEARDOWN",
+                &uri,
+                &[("Session", "0".into())],
+                None,
+                TEARDOWN_RESPONSE_TIMEOUT,
+            )
             .await
         {
-            warn!("AP2 TEARDOWN failed: {e}");
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!("AP2 TEARDOWN failed: {e}"),
+            Err(_) => warn!("AP2 TEARDOWN: no response; closing anyway"),
         }
     }
 }

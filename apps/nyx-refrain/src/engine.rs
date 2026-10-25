@@ -557,6 +557,7 @@ async fn run(
     let mut last_receiver_vol: Option<f32> = None;
     let mut feedback = tokio::time::interval(Duration::from_secs(2));
     let mut refresh = tokio::time::interval(Duration::from_millis(500));
+    let mut audio_watch = crate::audio_watch::AudioWatch::from_env();
     let (disc_tx, mut disc_rx) = mpsc::unbounded_channel::<Vec<DeviceEntry>>();
     let (fw_tx, mut fw_rx) = mpsc::unbounded_channel::<Firewall>();
     // Commands issued by the engine itself (resume attempts); never closes.
@@ -1025,6 +1026,7 @@ async fn run(
                         g.stats.dropped = m.packets_dropped;
                         g.stats.discontinuities = m.capture_discontinuities;
                     }
+                    audio_watch.sample(&r.metrics, &st, m.buffer_fill_packets);
                     notifier.wake();
                 }
             }
