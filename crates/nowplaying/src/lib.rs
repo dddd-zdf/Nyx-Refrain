@@ -992,6 +992,13 @@ mod win {
         let mut manager = None;
         let mut thumbnail = Thumbnail::default();
 
+        // Between polls, wait on the command channel instead of waking every 50 ms: commands
+        // run as soon as they arrive, and dropping the watcher closes the channel.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .ok();
+
         let mut selected = None;
         let mut next_poll = Instant::now();
         while !stop.load(Ordering::Relaxed) {
@@ -1014,27 +1021,39 @@ mod win {
                 }
                 next_poll = now + Duration::from_secs(1);
             }
-            while let Ok(command) = commands.try_recv() {
-                if stop.load(Ordering::Relaxed) {
-                    break;
+            let wait = next_poll.saturating_duration_since(Instant::now());
+            let command = match &rt {
+                Some(rt) => match rt.block_on(tokio::time::timeout(wait, commands.recv())) {
+                    Ok(Some(command)) => Some(command),
+                    // The watcher was dropped.
+                    Ok(None) => break,
+                    // The next poll is due.
+                    Err(_) => None,
+                },
+                None => {
+                    std::thread::sleep(wait.min(Duration::from_millis(50)));
+                    commands.try_recv().ok()
                 }
-                let Some(session) = &selected else {
-                    tracing::debug!(
-                        ?command,
-                        "nowplaying: no selected SMTC session; ignoring control"
-                    );
-                    continue;
-                };
-                match control(session, command) {
-                    Ok(true) => tracing::debug!(?command, "nowplaying: SMTC command sent"),
-                    Ok(false) => tracing::debug!(
-                        ?command,
-                        "nowplaying: SMTC action unsupported, rejected, or duration unavailable; ignored"
-                    ),
-                    Err(e) => tracing::debug!(?command, "nowplaying: SMTC control failed: {e}"),
-                }
+            };
+            let Some(command) = command else { continue };
+            if stop.load(Ordering::Relaxed) {
+                break;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            let Some(session) = &selected else {
+                tracing::debug!(
+                    ?command,
+                    "nowplaying: no selected SMTC session; ignoring control"
+                );
+                continue;
+            };
+            match control(session, command) {
+                Ok(true) => tracing::debug!(?command, "nowplaying: SMTC command sent"),
+                Ok(false) => tracing::debug!(
+                    ?command,
+                    "nowplaying: SMTC action unsupported, rejected, or duration unavailable; ignored"
+                ),
+                Err(e) => tracing::debug!(?command, "nowplaying: SMTC control failed: {e}"),
+            }
         }
 
         unsafe {
