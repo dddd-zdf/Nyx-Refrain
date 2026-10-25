@@ -277,13 +277,8 @@ impl AudioSource for WasapiLoopbackSource {
         let max_samples = max_frames * channels;
         let mut samples = Vec::with_capacity(max_samples);
 
-        // Drain available samples from lock-free SPSC consumer
-        while samples.len() < max_samples {
-            match self.consumer.pop() {
-                Ok(sample) => samples.push(sample),
-                Err(rtrb::PopError::Empty) => break,
-            }
-        }
+        // Drain available whole frames from lock-free SPSC consumer
+        super::pop_frames(&mut self.consumer, max_samples, channels, &mut samples);
 
         if samples.is_empty() {
             // No captured data right now (WASAPI delivers every ~10 ms). Report "nothing yet"
@@ -489,12 +484,13 @@ fn run_capture_loop(
                         )
                         .is_ok()
                     {
-                        // Push into lock-free rtrb buffer (Zero heap alloc, zero locks, zero logs in RT loop!)
-                        for &sample in &sample_buf {
-                            if producer.push(sample).is_err() {
-                                // Ring buffer full; count as dropped frame without blocking
-                                discontinuity_tracker.record_packet(FLAG_DATA_DISCONTINUITY, 1);
-                            }
+                        // Push into lock-free rtrb buffer (zero heap alloc, zero locks)
+                        let channels = session.format_info.channels as usize;
+                        let dropped = super::push_frames(&mut producer, &sample_buf, channels);
+                        if dropped > 0 {
+                            // Ring buffer full; count once per block without blocking
+                            discontinuity_tracker
+                                .record_packet(FLAG_DATA_DISCONTINUITY, dropped / channels.max(1));
                         }
                     }
                 }
