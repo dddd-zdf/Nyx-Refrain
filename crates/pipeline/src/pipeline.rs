@@ -34,6 +34,8 @@ pub struct PipelineProcessor {
     source_sample_rate: u32,
     resampler: ResamplePipeline,
     drift: DriftCompensator,
+    /// Steer the queue fill (live sources); paced sources keep the nominal ratio.
+    steer: bool,
     dither: TpdfDither,
     underrun_timeout: Duration,
     last_chunk_time: Option<Instant>,
@@ -44,10 +46,22 @@ pub struct PipelineProcessor {
 }
 
 impl PipelineProcessor {
-    /// Create a new PipelineProcessor for given source sample rate.
-    /// See [`DriftCompensator::set_target_fill_level`].
+    /// Steers the queue towards `packets` (live sources). Without this the processor keeps
+    /// the nominal ratio: back-pressured sources hold the queue full, so there is no clock
+    /// difference to correct. See [`DriftCompensator::set_target_fill_level`].
     pub fn set_target_fill_level(&mut self, packets: usize) {
         self.drift.set_target_fill_level(packets);
+        self.steer = true;
+    }
+
+    /// Fill level (packets) to top the queue up to after the sender ran dry, when steering.
+    pub fn refill_target(&self) -> Option<usize> {
+        self.steer.then(|| self.drift.target_fill_level())
+    }
+
+    /// Tells the drift controller the queue was just topped up to `fill` packets.
+    pub fn refilled(&mut self, fill: usize) {
+        self.drift.refilled(fill);
     }
 
     pub fn new(
@@ -66,6 +80,7 @@ impl PipelineProcessor {
             source_sample_rate,
             resampler,
             drift,
+            steer: false,
             dither: TpdfDither::default(),
             underrun_timeout: underrun_timeout
                 .unwrap_or(Duration::from_millis(DEFAULT_UNDERRUN_TIMEOUT_MS)),
@@ -121,13 +136,12 @@ impl PipelineProcessor {
         downmix_to_stereo(&chunk.data, chunk.channels, &mut downmix);
 
         // 2. Clock drift compensation
-        let dt = Duration::from_millis(10); // nominal chunk interval
-        let corr_ppm = self.drift.compute_correction(
-            chunk.frame_count(),
-            chunk.timestamp,
-            current_fill_packets,
-            dt,
-        );
+        let corr_ppm = if self.steer {
+            self.drift
+                .compute_correction(chunk.frame_count(), current_fill_packets)
+        } else {
+            0.0
+        };
         let rel_ratio = DriftCompensator::ppm_to_relative_ratio(corr_ppm);
         self.resampler.set_relative_ratio(rel_ratio)?;
         self.metrics
@@ -237,6 +251,7 @@ pub fn start_pipeline_feeder(
             let data_signal = source.data_signal();
             let mut packets_batch = Vec::with_capacity(8);
             let mut last_activity = Instant::now();
+            let mut starved_seen = metrics.glitch_counts().sender_starved;
 
             // Calculate chunk size for ~10 ms reads
             let read_frames = (sample_rate / 100).max(128) as usize;
@@ -249,7 +264,25 @@ pub fn start_pipeline_feeder(
                         last_activity = Instant::now();
                         packets_batch.clear();
                         let current_fill = producer.slots(); // capacity - slots = fill
-                        let ring_fill = DEFAULT_RING_BUFFER_PACKETS.saturating_sub(current_fill);
+                        let mut ring_fill =
+                            DEFAULT_RING_BUFFER_PACKETS.saturating_sub(current_fill);
+
+                        let starved = metrics.glitch_counts().sender_starved;
+                        if starved != starved_seen {
+                            starved_seen = starved;
+                            // The sender just ran dry and sent silence. Top the queue back up
+                            // to the target in one step (stretching that silence by a few ms)
+                            // rather than steering up over ~50 s, during which every timing
+                            // bump would leave another gap.
+                            if let Some(target) = processor.refill_target() {
+                                while ring_fill < target
+                                    && producer.push([0i16; ALAC_PCM_SAMPLES]).is_ok()
+                                {
+                                    ring_fill += 1;
+                                }
+                                processor.refilled(ring_fill);
+                            }
+                        }
                         metrics.set_buffer_fill(ring_fill);
 
                         if let Ok(()) =
