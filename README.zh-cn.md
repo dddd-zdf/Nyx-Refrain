@@ -105,6 +105,7 @@ nyxr list-interfaces
 
 - `--volume`：0 为静音，1–100 为百分比（映射到 −30..0 dB），也可以直接写负的分贝值，如 `-15`。
 - `--source`：Windows 默认 `wasapi`（设备回环），`process` 为按进程采集；Linux 默认 `pipewire`。另有 `sine`、`wav`、`stdin`。
+- `--source stdin` 读入 16 位 44.1 kHz 音频时逐位不变地送到音箱（bit-perfect）。如果 stdin 上的音频按另一台设备的时钟实时写入，而不是按 nyxr 的读取速度供给（例如蓝牙接收器），加上 `--input-live`：nyxr 会保持 `--input-buffer-ms`（默认 150）的缓冲，并通过重采样跟随该时钟。
 - 完整参数见 `nyxr --help` 与 `nyxr <子命令> --help`。
 
 常用参数可以写进配置文件，之后直接 `nyxr stream --audible` 即可：
