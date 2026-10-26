@@ -1671,7 +1671,7 @@ impl winit::application::ApplicationHandler<Repaint> for Shell {
         _cause: winit::event::StartCause,
     ) {
         let now = Instant::now();
-        if !self.next_repaint.is_some_and(|at| at <= now) {
+        if self.next_repaint.is_none_or(|at| at > now) {
             return;
         }
         // At most ~60 passes a second: moving the pointer otherwise asks for one per event.

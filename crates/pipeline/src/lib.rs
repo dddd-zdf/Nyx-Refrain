@@ -12,7 +12,7 @@ pub mod resample;
 pub mod sent_recorder;
 pub mod timer;
 
-pub use convert::{TpdfDither, Xorshift64, downmix_to_stereo};
+pub use convert::{TpdfDither, Xorshift64, downmix_to_stereo, quantize_exact};
 pub use drift::{DriftCompensator, DriftConfig, MAX_DRIFT_CORRECTION_PPM};
 pub use metrics::{
     Glitch, GlitchCounts, PipelineMetricsTracker, PipelineStatsSnapshot, SharedPipelineMetrics,

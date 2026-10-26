@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use capture::{AudioChunk, AudioSource};
 
-use crate::convert::{TpdfDither, downmix_to_stereo};
+use crate::convert::{TpdfDither, downmix_to_stereo, quantize_exact};
 use crate::drift::{DriftCompensator, DriftConfig};
 use crate::metrics::{Glitch, SharedPipelineMetrics};
 use crate::resample::{DEFAULT_RESAMPLER_CHUNK_FRAMES, ResamplePipeline};
@@ -62,6 +62,15 @@ impl PipelineProcessor {
     /// Tells the drift controller the queue was just topped up to `fill` packets.
     pub fn refilled(&mut self, fill: usize) {
         self.drift.refilled(fill);
+    }
+
+    /// For sources paced by back-pressure (files, stdin): the sender's clock already sets
+    /// their rate, so there is no drift to correct. The resampler then stays at ratio 1.0,
+    /// which at 44.1 kHz is a passthrough, and 16-bit input reaches the receiver bit-perfect.
+    pub fn disable_drift_compensation(&mut self) {
+        self.steer = false;
+        self.drift.reset();
+        self.metrics.set_drift_ppm(0.0, 0.0);
     }
 
     pub fn new(
@@ -155,7 +164,7 @@ impl PipelineProcessor {
         Ok(())
     }
 
-    /// Process stereo f32 samples through resampler, TPDF dither, and packetizer.
+    /// Process stereo f32 samples through resampler, quantizer, and packetizer.
     fn process_stereo_f32(
         &mut self,
         stereo_f32: &[f32],
@@ -165,12 +174,7 @@ impl PipelineProcessor {
         self.resampler
             .process(stereo_f32, &mut self.resampled_f32)?;
 
-        // Quantize resampled f32 to s16 with TPDF dither
-        let start_len = self.staging_s16.len();
-        self.staging_s16
-            .resize(start_len + self.resampled_f32.len(), 0);
-        self.dither
-            .quantize_slice(&self.resampled_f32, &mut self.staging_s16[start_len..]);
+        self.quantize_resampled();
 
         // Extract complete 352-frame packets (704 s16 samples)
         while self.staging_s16.len() >= ALAC_PCM_SAMPLES {
@@ -183,17 +187,25 @@ impl PipelineProcessor {
         Ok(())
     }
 
+    /// Append `resampled_f32` to `staging_s16`: exactly if it is untouched 16-bit audio,
+    /// otherwise with TPDF dither.
+    fn quantize_resampled(&mut self) {
+        let start_len = self.staging_s16.len();
+        self.staging_s16
+            .resize(start_len + self.resampled_f32.len(), 0);
+        let out = &mut self.staging_s16[start_len..];
+        if !quantize_exact(&self.resampled_f32, out) {
+            self.dither.quantize_slice(&self.resampled_f32, out);
+        }
+    }
+
     /// Flush remaining staged samples into packets, padding the final packet with silence.
     pub fn flush(&mut self, packets_out: &mut Vec<[i16; ALAC_PCM_SAMPLES]>) -> Result<(), String> {
         self.resampled_f32.clear();
         self.resampler.flush(&mut self.resampled_f32)?;
 
         if !self.resampled_f32.is_empty() {
-            let start_len = self.staging_s16.len();
-            self.staging_s16
-                .resize(start_len + self.resampled_f32.len(), 0);
-            self.dither
-                .quantize_slice(&self.resampled_f32, &mut self.staging_s16[start_len..]);
+            self.quantize_resampled();
         }
 
         if !self.staging_s16.is_empty() {
@@ -244,6 +256,8 @@ pub fn start_pipeline_feeder(
             if source.is_live() {
                 // Live capture: the sender trims above 8 packets, so steer to 3.
                 processor.set_target_fill_level(LIVE_TARGET_FILL_PACKETS);
+            } else {
+                processor.disable_drift_compensation();
             }
             let _ = source.start();
             // Sources that signal new audio let this thread sleep until a packet arrives
@@ -424,5 +438,37 @@ mod tests {
         let mut empty_packets = Vec::new();
         proc.flush(&mut empty_packets).unwrap();
         assert_eq!(empty_packets.len(), 0);
+    }
+
+    /// 16-bit 44.1 kHz stereo from a back-pressured source (a CD on stdin) must reach the
+    /// packets unchanged: no resampling, no dither.
+    #[test]
+    fn test_pipeline_16bit_stdin_is_bit_perfect() {
+        use capture::sources::stdin::{StdinFormat, StdinSource};
+
+        let mut rng = crate::convert::Xorshift64::new(7);
+        let samples: Vec<i16> = (0..ALAC_PCM_SAMPLES * 40)
+            .map(|_| rng.next_u64() as i16)
+            .chain([i16::MIN, i16::MAX, 0, -1, 1, i16::MIN + 1])
+            .collect();
+        let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut source =
+            StdinSource::new(std::io::Cursor::new(bytes), StdinFormat::S16Le, 44100, 2);
+
+        let metrics = Arc::new(PipelineMetricsTracker::new(DEFAULT_RING_BUFFER_PACKETS));
+        let mut proc = PipelineProcessor::new(44100, metrics.clone(), None).unwrap();
+        proc.disable_drift_compensation();
+        let mut packets = Vec::new();
+        while let Some(chunk) = source.read_chunk(441).unwrap() {
+            // A back-pressured ring sits full; this must not steer the rate.
+            proc.process_chunk(&chunk, DEFAULT_RING_BUFFER_PACKETS, &mut packets)
+                .unwrap();
+        }
+        proc.flush(&mut packets).unwrap();
+
+        let out: Vec<i16> = packets.concat();
+        assert_eq!(&out[..samples.len()], &samples[..]);
+        assert!(out[samples.len()..].iter().all(|&s| s == 0));
+        assert_eq!(metrics.snapshot().applied_correction_ppm, 0.0);
     }
 }
