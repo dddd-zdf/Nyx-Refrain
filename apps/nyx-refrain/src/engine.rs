@@ -372,6 +372,7 @@ type OutputSwitch = ();
 
 #[derive(Default)]
 struct StreamOutput {
+    #[cfg_attr(not(windows), allow(dead_code))]
     guard: Option<OutputSwitch>,
     /// (ours, the output it replaced) when stopping found another output the default (a
     /// headset turned on): if that output's app later switches to ours, we switch back.
