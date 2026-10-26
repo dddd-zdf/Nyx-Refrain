@@ -566,6 +566,9 @@ mod tests {
         assert!(!is_desktop_entry_enabled(upper_gnome));
     }
 
+    // Unix path semantics: on Windows "/usr/bin/..." has no drive letter, so it
+    // is not absolute and gets joined onto the current drive.
+    #[cfg(unix)]
     #[test]
     fn test_resolve_linux_exec_cmd() {
         let p = Path::new("/usr/bin/nyx-refrain");
