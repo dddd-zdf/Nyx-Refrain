@@ -23,7 +23,9 @@ const LEGEND: &str = "\
 # wasapi   Windows flagged a break in the captured audio
 # skipped  frames Windows never handed over (lost before capture, or its buffer overflowed)
 # overflow captured frames dropped because the capture buffer was full
-# resend   packets the speaker asked for again (network loss)
+# resend   resend requests from the speaker (network loss); one request can name several packets
+# resent   packets sent again in answer
+# unsent   packets asked for that were too old to send again (heard as a crackle)
 # clipped  samples louder than full scale, cut off at the limit (crackle on loud parts)
 # timer    send-timer waits that ran out at the 50 ms fallback instead of firing
 # late     largest delay past a packet's scheduled send time (flagged from 5 ms)
@@ -44,6 +46,8 @@ struct Counts {
     sent: u64,
     trimmed: u64,
     resend: u64,
+    resent: u64,
+    unsent: u64,
     glitches: GlitchCounts,
     wasapi: u64,
     overflow: u64,
@@ -67,6 +71,8 @@ impl Counts {
             sent: snap.packets_sent,
             trimmed: snap.packets_dropped,
             resend: stats.retransmit_requests.load(Ordering::Relaxed),
+            resent: stats.retransmit_served.load(Ordering::Relaxed),
+            unsent: stats.retransmit_missing.load(Ordering::Relaxed),
             glitches: metrics.glitch_counts(),
             wasapi,
             overflow,
@@ -158,6 +164,8 @@ impl AudioWatch {
             ("skipped", d(now.skipped, last.skipped)),
             ("overflow", d(now.overflow, last.overflow)),
             ("resend", d(now.resend, last.resend)),
+            ("resent", d(now.resent, last.resent)),
+            ("unsent", d(now.unsent, last.unsent)),
             ("clipped", d(now.clipped, last.clipped)),
             ("timer", d(now.timer, last.timer)),
         ];
