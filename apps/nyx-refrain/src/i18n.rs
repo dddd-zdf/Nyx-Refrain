@@ -285,10 +285,10 @@ pub fn t(lang: Lang, key: Key) -> &'static str {
         (Lang::ZhCn, Key::MuteLocal) => "推流时静音本机",
         (Lang::En, Key::MuteLocal) => "Mute this PC while streaming",
         (Lang::ZhCn, Key::MuteLocalHint) => {
-            "避免本机和音箱一前一后同时出声，停止推流后恢复。设备回环采集时不可用"
+            "避免本机和音箱一前一后同时出声，停止推流后恢复"
         }
         (Lang::En, Key::MuteLocalHint) => {
-            "So this PC and the speaker don't play out of sync; unmuted when streaming stops. Not available with device loopback capture"
+            "So this PC and the speaker don't play out of sync; unmuted when streaming stops"
         }
         (Lang::ZhCn, Key::AudioLog) => "音频日志（调试）",
         (Lang::En, Key::AudioLog) => "Audio log (debug)",
