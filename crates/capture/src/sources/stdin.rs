@@ -13,6 +13,33 @@ pub enum StdinFormat {
     F32Le,
 }
 
+impl StdinFormat {
+    /// Size of one sample in bytes.
+    pub(crate) fn bytes_per_sample(self) -> usize {
+        match self {
+            StdinFormat::S16Le => 2,
+            StdinFormat::F32Le => 4,
+        }
+    }
+
+    /// Append the samples in `bytes` (a whole number of samples) to `out` as normalized f32.
+    pub(crate) fn decode(self, bytes: &[u8], out: &mut Vec<f32>) {
+        match self {
+            StdinFormat::S16Le => {
+                for chunk in bytes.chunks_exact(2) {
+                    let s = i16::from_le_bytes([chunk[0], chunk[1]]);
+                    out.push(s as f32 / 32768.0);
+                }
+            }
+            StdinFormat::F32Le => {
+                for chunk in bytes.chunks_exact(4) {
+                    out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                }
+            }
+        }
+    }
+}
+
 /// Audio source that streams raw PCM data from standard input or any readable stream.
 pub struct StdinSource<R: Read + Send> {
     reader: R,
@@ -66,12 +93,7 @@ impl<R: Read + Send> AudioSource for StdinSource<R> {
             )));
         }
 
-        let bytes_per_sample = match self.format {
-            StdinFormat::S16Le => 2,
-            StdinFormat::F32Le => 4,
-        };
-
-        let frame_size = bytes_per_sample * self.channels as usize;
+        let frame_size = self.format.bytes_per_sample() * self.channels as usize;
         let mut byte_buffer = vec![0u8; max_frames * frame_size];
 
         let mut total_bytes_read = 0;
@@ -96,20 +118,8 @@ impl<R: Read + Send> AudioSource for StdinSource<R> {
 
         let mut data = Vec::with_capacity(complete_frames * self.channels as usize);
 
-        match self.format {
-            StdinFormat::S16Le => {
-                for chunk in byte_buffer[..complete_frames * frame_size].chunks_exact(2) {
-                    let s = i16::from_le_bytes([chunk[0], chunk[1]]);
-                    data.push(s as f32 / 32768.0);
-                }
-            }
-            StdinFormat::F32Le => {
-                for chunk in byte_buffer[..complete_frames * frame_size].chunks_exact(4) {
-                    let s = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    data.push(s);
-                }
-            }
-        }
+        self.format
+            .decode(&byte_buffer[..complete_frames * frame_size], &mut data);
 
         let chunk_time = {
             let elapsed = self.frames_produced as u64;

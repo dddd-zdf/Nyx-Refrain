@@ -12,6 +12,8 @@
 //!
 //! Corrections are clamped to `[-500.0, 500.0]` ppm (under 1 cent of pitch).
 
+use std::time::Duration;
+
 /// Maximum allowable drift correction in parts per million (±500 ppm).
 pub const MAX_DRIFT_CORRECTION_PPM: f64 = 500.0;
 
@@ -144,6 +146,107 @@ impl DriftCompensator {
     }
 }
 
+/// Proportional gain of [`QueueController`]: ppm per second of queue error. With the
+/// critically damped integral below, the loop's time constant is `2 / (KP * 1e-6)` ≈ 33 s,
+/// slow enough to ignore arrival bursts.
+const QUEUE_KP: f64 = 60_000.0;
+/// Integral gain of [`QueueController`] (ppm per second² of queue error): `KP² / 4` in ppm
+/// units, which damps the loop critically.
+const QUEUE_KI: f64 = QUEUE_KP * QUEUE_KP * 1e-6 / 4.0;
+/// Smoothing time of the measured queue level.
+const QUEUE_FILTER_SECS: f64 = 1.0;
+/// After playback (re)starts, the queue level is averaged this long to find the level to hold.
+const QUEUE_SETTLE_SECS: f64 = 2.0;
+
+/// Steers the resampler from the fill of a source's own jitter queue, for audio that arrives
+/// on another device's clock but is read on demand (live stdin).
+///
+/// The queue grows when the producer runs faster than the receiver consumes it, so a PI loop on
+/// the queue error (in seconds) settles on the clock difference. Its integral term is that
+/// difference, reported as the estimated drift.
+///
+/// The level held is the average over the first seconds after playback (re)starts, not the
+/// source's buffering target: bursty delivery leaves the average below the level playback
+/// started at, and steering that offset away is not drift correction (near the ppm limit it
+/// takes minutes).
+#[derive(Debug, Default)]
+pub struct QueueController {
+    /// Low-pass filtered queue level in frames; `None` until the first level after a reset.
+    filtered_frames: Option<f64>,
+    /// Level held, in frames; `None` while settling.
+    setpoint: Option<f64>,
+    /// Sum of level × seconds and seconds seen while settling.
+    settle: (f64, f64),
+    /// Integral of the queue error, in seconds².
+    integral: f64,
+    applied_correction_ppm: f64,
+}
+
+impl QueueController {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Update with the queue level in frames after `dt` of audio at `sample_rate` and return
+    /// the correction in ppm (positive when the producer is faster). Without a level (the
+    /// source is buffering) and while settling after it, the estimated drift alone is applied.
+    pub fn update(&mut self, level: Option<usize>, sample_rate: u32, dt: Duration) -> f64 {
+        let dt_secs = dt.as_secs_f64();
+        let frames = match (level, self.setpoint) {
+            (None, _) => {
+                self.filtered_frames = None;
+                self.setpoint = None;
+                self.settle = (0.0, 0.0);
+                return self.hold_estimate();
+            }
+            (Some(frames), None) => {
+                self.settle.0 += frames as f64 * dt_secs;
+                self.settle.1 += dt_secs;
+                if self.settle.1 >= QUEUE_SETTLE_SECS {
+                    let average = self.settle.0 / self.settle.1;
+                    self.setpoint = Some(average);
+                    self.filtered_frames = Some(average);
+                }
+                return self.hold_estimate();
+            }
+            (Some(frames), Some(_)) => frames as f64,
+        };
+        let filtered = match self.filtered_frames {
+            Some(f) => f + (frames - f) * (dt_secs / QUEUE_FILTER_SECS).min(1.0),
+            None => frames,
+        };
+        self.filtered_frames = Some(filtered);
+
+        let setpoint = self.setpoint.unwrap_or(filtered);
+        let error_secs = (filtered - setpoint) / sample_rate.max(1) as f64;
+        let integral = self.integral + error_secs * dt_secs;
+        let unclamped = QUEUE_KP * error_secs + QUEUE_KI * integral;
+        // Anti-windup: while the output is pinned at the limit, an error pushing further that
+        // way is not integrated. Otherwise a long recovery at the limit (e.g. refilling after
+        // playback starts) winds the integral far past the actual drift.
+        if unclamped.abs() <= MAX_DRIFT_CORRECTION_PPM || unclamped.signum() != error_secs.signum()
+        {
+            let integral_max = MAX_DRIFT_CORRECTION_PPM / QUEUE_KI;
+            self.integral = integral.clamp(-integral_max, integral_max);
+        }
+        self.applied_correction_ppm = (QUEUE_KP * error_secs + QUEUE_KI * self.integral)
+            .clamp(-MAX_DRIFT_CORRECTION_PPM, MAX_DRIFT_CORRECTION_PPM);
+        self.applied_correction_ppm
+    }
+
+    /// The clock difference settled on so far, in ppm.
+    pub fn estimated_drift_ppm(&self) -> f64 {
+        QUEUE_KI * self.integral
+    }
+
+    fn hold_estimate(&mut self) -> f64 {
+        self.applied_correction_ppm = self
+            .estimated_drift_ppm()
+            .clamp(-MAX_DRIFT_CORRECTION_PPM, MAX_DRIFT_CORRECTION_PPM);
+        self.applied_correction_ppm
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +360,95 @@ mod tests {
         let r_neg = DriftCompensator::ppm_to_relative_ratio(-500.0);
         assert!(r_neg > 1.0);
         assert!((r_neg - (1.0 / 0.9995)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn queue_controller_speeds_up_when_the_queue_grows() {
+        let dt = Duration::from_millis(10);
+        let settled = || {
+            let mut q = QueueController::new();
+            for _ in 0..200 {
+                assert_eq!(q.update(Some(4_410), 44_100, dt), 0.0);
+            }
+            q
+        };
+        let mut q = settled();
+        assert!(q.update(Some(5_000), 44_100, dt) > 0.0);
+        let mut q = settled();
+        assert!(q.update(Some(4_000), 44_100, dt) < 0.0);
+        // Buffering: only the estimated drift is applied.
+        assert_eq!(q.update(None, 44_100, dt), q.estimated_drift_ppm());
+    }
+
+    /// Closed loop as live stdin runs it: a producer whose clock is off by `drift_ppm`
+    /// delivers bursts with up to 30 ms of jitter, the pipeline reads 10 ms chunks and reports
+    /// the level before each read, playback starts with the queue at its target, and a 2 s
+    /// pause empties the queue once. The controller must settle on the drift without
+    /// overshooting it, and hold the queue without running dry or overflowing.
+    fn simulate_queue_loop(drift_ppm: f64) {
+        let rate = 44_100.0;
+        let target = 6_615.0; // 150 ms
+        let chunk = 441.0;
+        let dt = 0.01;
+        let mut rng = crate::convert::Xorshift64::new(42);
+        let mut q = QueueController::new();
+        let mut level = target;
+        let mut playing = true;
+        let mut owed = 0.0; // produced but not yet delivered (held back by jitter)
+        let mut next_burst = 0.0;
+        let mut corr_ppm = 0.0;
+        let (mut min_level, mut max_level) = (f64::MAX, 0.0f64);
+        let (mut min_est, mut max_est) = (0.0f64, 0.0f64);
+        for step in 0..60_000 {
+            let t = step as f64 * dt;
+            if !(300.0..302.0).contains(&t) {
+                owed += rate * (1.0 + drift_ppm * 1e-6) * dt;
+            }
+            if t >= next_burst {
+                level += owed;
+                owed = 0.0;
+                next_burst = t + 0.005 + (rng.next_uniform_sym() as f64 + 0.5) * 0.03;
+            }
+            if !playing && level >= target {
+                level = target;
+                playing = true;
+            }
+            if !playing || level < chunk {
+                playing = false;
+                corr_ppm = q.update(None, 44_100, Duration::from_secs_f64(dt));
+                continue;
+            }
+            let measured = level;
+            level -= chunk * (1.0 + corr_ppm * 1e-6);
+            if !(300.0..310.0).contains(&t) {
+                min_level = min_level.min(level);
+                max_level = max_level.max(level);
+            }
+            corr_ppm = q.update(Some(measured as usize), 44_100, Duration::from_secs_f64(dt));
+            min_est = min_est.min(q.estimated_drift_ppm());
+            max_est = max_est.max(q.estimated_drift_ppm());
+        }
+        let (low, high) = (drift_ppm.min(0.0), drift_ppm.max(0.0));
+        assert!(
+            min_est > low - 30.0 && max_est < high + 30.0,
+            "estimate swung over {min_est:.0}..{max_est:.0} ppm for {drift_ppm} ppm"
+        );
+        assert!(
+            (q.estimated_drift_ppm() - drift_ppm).abs() < 5.0,
+            "estimated {} ppm, actual {drift_ppm}",
+            q.estimated_drift_ppm()
+        );
+        assert!(min_level > 0.0, "queue ran dry");
+        assert!(max_level < target * 3.0, "queue overflowed: {max_level}");
+    }
+
+    #[test]
+    fn queue_controller_follows_a_fast_producer() {
+        simulate_queue_loop(100.0);
+    }
+
+    #[test]
+    fn queue_controller_follows_a_slow_producer() {
+        simulate_queue_loop(-300.0);
     }
 }

@@ -39,6 +39,11 @@ enum Commands {
         #[arg(long, allow_hyphen_values = true)]
         volume: Option<f32>,
 
+        /// Leave the receiver's volume as it is: send no initial volume (ignores `volume` in the
+        /// config file; quiet mode still mutes)
+        #[arg(long, conflicts_with = "volume")]
+        keep_volume: bool,
+
         /// Audio capture source (pipewire, wasapi, process, sine, wav, stdin). `process` (Windows):
         /// per-application loopback of everything except nyxr, taken before the output device's
         /// effects and volume; with `--device <PID>` only that process tree
@@ -56,6 +61,15 @@ enum Commands {
         /// Channel count of raw PCM on stdin
         #[arg(long, default_value_t = 2)]
         input_channels: u16,
+
+        /// stdin is written live on another device's clock (e.g. a Bluetooth A2DP sink) rather
+        /// than as fast as nyxr reads it: buffer it and follow that clock by resampling
+        #[arg(long)]
+        input_live: bool,
+
+        /// Audio kept buffered with --input-live, in ms (absorbs bursty delivery)
+        #[arg(long, default_value_t = 150, value_parser = clap::value_parser!(u32).range(20..=2000))]
+        input_buffer_ms: u32,
 
         /// Audio device name or ID (or WAV file path when --source wav; on Linux overrides virtual sink description)
         #[arg(long)]
@@ -318,6 +332,8 @@ struct StdinOpts {
     rate: u32,
     format: StdinFmtArg,
     channels: u16,
+    /// Jitter buffer for a live producer (`--input-live`).
+    live_buffer: Option<Duration>,
 }
 
 #[cfg(target_os = "linux")]
@@ -350,14 +366,25 @@ fn create_audio_source(
             (),
         )),
         "stdin" => Ok((
-            Box::new(capture::sources::stdin::StdinSource::from_stdin(
-                match stdin.format {
+            {
+                let format = match stdin.format {
                     StdinFmtArg::S16le => capture::sources::stdin::StdinFormat::S16Le,
                     StdinFmtArg::F32le => capture::sources::stdin::StdinFormat::F32Le,
-                },
-                stdin.rate,
-                stdin.channels,
-            )),
+                };
+                match stdin.live_buffer {
+                    Some(buffer) => Box::new(capture::LiveStdinSource::from_stdin(
+                        format,
+                        stdin.rate,
+                        stdin.channels,
+                        buffer,
+                    )?),
+                    None => Box::new(capture::sources::stdin::StdinSource::from_stdin(
+                        format,
+                        stdin.rate,
+                        stdin.channels,
+                    )) as Box<dyn capture::AudioSource>,
+                }
+            },
             #[cfg(target_os = "linux")]
             None,
             #[cfg(not(target_os = "linux"))]
@@ -583,10 +610,13 @@ async fn main() -> anyhow::Result<()> {
             target,
             interface,
             volume,
+            keep_volume,
             source,
             input_rate,
             input_format,
             input_channels,
+            input_live,
+            input_buffer_ms,
             device,
             no_set_default,
             stats,
@@ -617,27 +647,33 @@ async fn main() -> anyhow::Result<()> {
             let source_name = source.unwrap_or(cfg.capture);
 
             let effective_quiet = quiet || (!audible && source_name == "silence");
-            let volume_db = raop::volume::cli_volume_to_db(target_vol, effective_quiet);
+            let volume_db =
+                (!keep_volume).then(|| raop::volume::cli_volume_to_db(target_vol, effective_quiet));
 
             let stdin_opts = StdinOpts {
                 rate: input_rate,
                 format: input_format,
                 channels: input_channels,
+                live_buffer: input_live.then(|| Duration::from_millis(input_buffer_ms.into())),
             };
             if source_name == "stdin" {
                 info!(
                     "stdin PCM: {:?}, {} Hz, {} ch (set --input-rate/--input-format/--input-channels to match the producer)",
                     input_format, input_rate, input_channels
                 );
+                if input_live {
+                    info!(
+                        "stdin is live: keeping {input_buffer_ms} ms buffered and following the producer's clock"
+                    );
+                }
             }
             #[cfg(target_os = "linux")]
-            let initial_sink_volume = if source_name == "pipewire" {
-                Some(capture::pipewire::SinkVolume {
-                    pct: raop::volume::db_to_pct(volume_db),
-                    mute: effective_quiet || volume_db <= -144.0,
-                })
-            } else {
-                None
+            let initial_sink_volume = match volume_db {
+                Some(db) if source_name == "pipewire" => Some(capture::pipewire::SinkVolume {
+                    pct: raop::volume::db_to_pct(db),
+                    mute: effective_quiet || db <= -144.0,
+                }),
+                _ => None,
             };
             #[allow(unused_variables)]
             let (audio_source, vol_ctrl) = create_audio_source(
@@ -851,7 +887,7 @@ async fn main() -> anyhow::Result<()> {
             let run = ap2run::Ap2Run {
                 target: target_addr,
                 interface,
-                volume_db,
+                volume_db: Some(volume_db),
                 quiet: effective_quiet,
                 sync_latency_ms: ap2run::sync_latency_ms(latency_profile, ap2_sync_latency_ms)?,
                 duration,

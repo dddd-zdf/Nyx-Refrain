@@ -54,7 +54,8 @@ pub fn sync_latency_ms(profile: LatencyProfile, explicit: Option<i32>) -> anyhow
 pub struct Ap2Run {
     pub target: SocketAddr,
     pub interface: Option<String>,
-    pub volume_db: f32,
+    /// Initial receiver volume; `None` leaves it unchanged (see `Ap2Config::volume_db`).
+    pub volume_db: Option<f32>,
     pub quiet: bool,
     pub sync_latency_ms: i32,
     pub duration: Option<u64>,

@@ -85,8 +85,9 @@ pub struct Ap2Config {
     /// Values for the stream SETUP (`latencyMin` / `latencyMax`, frames).
     pub latency_min: u32,
     pub latency_max: u32,
-    /// `volume: <dB>` (-30..0, -144 = mute) sent before audio.
-    pub volume_db: f32,
+    /// `volume: <dB>` (-30..0, -144 = mute) sent before audio; `None` sends no volume, so the
+    /// receiver keeps its own (quiet mode still sends -144).
+    pub volume_db: Option<f32>,
     /// Send packets this far ahead of their nominal time (burst at start).
     pub prefill_ms: u32,
     /// Bytes 2..3 of sync packets (0x0007 iTunes / 0x0004 AirPlay).
@@ -120,7 +121,7 @@ impl Default for Ap2Config {
             latency_frames: 11_025,
             latency_min: 11_025,
             latency_max: 88_200,
-            volume_db: -144.0,
+            volume_db: Some(-144.0),
             prefill_ms: 0,
             sync_flag: SyncFlag::ITunes,
             quiet_mode: true,
@@ -845,25 +846,21 @@ impl Ap2Session {
         let rtp0 = clock.rtp_ts(start_at);
         let rtp_info = format!("seq={seq0};rtptime={rtp0}");
 
-        conn.request(
-            false,
-            "SET_PARAMETER",
-            &uri,
-            &[],
-            Some((
-                "text/parameters",
-                format!(
-                    "volume: {:.1}",
-                    if cfg.quiet_mode {
-                        -144.0
-                    } else {
-                        cfg.volume_db
-                    }
-                )
-                .into_bytes(),
-            )),
-        )
-        .await?;
+        let volume_db = if cfg.quiet_mode {
+            Some(-144.0)
+        } else {
+            cfg.volume_db
+        };
+        if let Some(db) = volume_db {
+            conn.request(
+                false,
+                "SET_PARAMETER",
+                &uri,
+                &[],
+                Some(("text/parameters", format!("volume: {db:.1}").into_bytes())),
+            )
+            .await?;
+        }
         if cfg.initial_progress {
             conn.request(
                 false,

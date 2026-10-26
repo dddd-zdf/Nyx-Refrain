@@ -1091,7 +1091,7 @@ async fn start(
     let cfg = Ap2Config {
         target: p.device.addr,
         latency_frames: latency * 441 / 10,
-        volume_db: pct_to_db(p.volume_pct),
+        volume_db: Some(pct_to_db(p.volume_pct)),
         quiet_mode: false,
         ..Default::default()
     };

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use capture::{AudioChunk, AudioSource};
 
 use crate::convert::{TpdfDither, downmix_to_stereo, quantize_exact};
-use crate::drift::{DriftCompensator, DriftConfig};
+use crate::drift::{DriftCompensator, DriftConfig, QueueController};
 use crate::metrics::{Glitch, SharedPipelineMetrics};
 use crate::resample::{DEFAULT_RESAMPLER_CHUNK_FRAMES, ResamplePipeline};
 
@@ -36,6 +36,9 @@ pub struct PipelineProcessor {
     drift: DriftCompensator,
     /// Steer the queue fill (live sources); paced sources keep the nominal ratio.
     steer: bool,
+    /// Steers the resampler from the source's jitter queue; see [`Self::set_source_queue`].
+    queue: Option<QueueController>,
+    source_queue: Option<usize>,
     dither: TpdfDither,
     underrun_timeout: Duration,
     last_chunk_time: Option<Instant>,
@@ -64,6 +67,16 @@ impl PipelineProcessor {
         self.drift.refilled(fill);
     }
 
+    /// Passes the source's [`AudioSource::queue_frames`] after each read. Once a source reports
+    /// a level, the resampler follows that queue instead of the drift estimator: the source is
+    /// read on demand, but its audio arrives on another device's clock.
+    pub fn set_source_queue(&mut self, level: Option<usize>) {
+        if level.is_some() && self.queue.is_none() {
+            self.queue = Some(QueueController::new());
+        }
+        self.source_queue = level;
+    }
+
     /// For sources paced by back-pressure (files, stdin): the sender's clock already sets
     /// their rate, so there is no drift to correct. The resampler then stays at ratio 1.0,
     /// which at 44.1 kHz is a passthrough, and 16-bit input reaches the receiver bit-perfect.
@@ -90,6 +103,8 @@ impl PipelineProcessor {
             resampler,
             drift,
             steer: false,
+            queue: None,
+            source_queue: None,
             dither: TpdfDither::default(),
             underrun_timeout: underrun_timeout
                 .unwrap_or(Duration::from_millis(DEFAULT_UNDERRUN_TIMEOUT_MS)),
@@ -145,16 +160,25 @@ impl PipelineProcessor {
         downmix_to_stereo(&chunk.data, chunk.channels, &mut downmix);
 
         // 2. Clock drift compensation
-        let corr_ppm = if self.steer {
-            self.drift
-                .compute_correction(chunk.frame_count(), current_fill_packets)
+        if let Some(queue) = &mut self.queue {
+            let corr_ppm =
+                queue.update(self.source_queue, self.source_sample_rate, chunk.duration());
+            let rel_ratio = DriftCompensator::ppm_to_relative_ratio(corr_ppm);
+            self.resampler.set_relative_ratio(rel_ratio)?;
+            self.metrics
+                .set_drift_ppm(queue.estimated_drift_ppm(), corr_ppm);
         } else {
-            0.0
-        };
-        let rel_ratio = DriftCompensator::ppm_to_relative_ratio(corr_ppm);
-        self.resampler.set_relative_ratio(rel_ratio)?;
-        self.metrics
-            .set_drift_ppm(self.drift.estimated_drift_ppm(), corr_ppm);
+            let corr_ppm = if self.steer {
+                self.drift
+                    .compute_correction(chunk.frame_count(), current_fill_packets)
+            } else {
+                0.0
+            };
+            let rel_ratio = DriftCompensator::ppm_to_relative_ratio(corr_ppm);
+            self.resampler.set_relative_ratio(rel_ratio)?;
+            self.metrics
+                .set_drift_ppm(self.drift.estimated_drift_ppm(), corr_ppm);
+        }
 
         // 3. Resample and packetize
         let res = self.process_stereo_f32(&downmix, packets_out);
@@ -276,6 +300,7 @@ pub fn start_pipeline_feeder(
                     Ok(Some(chunk)) => {
                         metrics.record_feeder_gap(last_activity.elapsed());
                         last_activity = Instant::now();
+                        processor.set_source_queue(source.queue_frames());
                         packets_batch.clear();
                         let current_fill = producer.slots(); // capacity - slots = fill
                         let mut ring_fill =
@@ -470,5 +495,33 @@ mod tests {
         assert_eq!(&out[..samples.len()], &samples[..]);
         assert!(out[samples.len()..].iter().all(|&s| s == 0));
         assert_eq!(metrics.snapshot().applied_correction_ppm, 0.0);
+    }
+
+    /// A source whose jitter queue grows makes the resampler consume faster; until it reports
+    /// a level, the passthrough is kept.
+    #[test]
+    fn test_pipeline_steers_by_the_source_queue() {
+        let metrics = Arc::new(PipelineMetricsTracker::new(DEFAULT_RING_BUFFER_PACKETS));
+        let mut proc = PipelineProcessor::new(44100, metrics.clone(), None).unwrap();
+        proc.disable_drift_compensation();
+        let mut packets = Vec::new();
+        let mut at = Instant::now();
+        for i in 0..400 {
+            // Steady through the settling time, then growing.
+            let level = (i >= 10).then_some(if i < 250 {
+                6_615
+            } else {
+                6_615 + (i - 250) * 50
+            });
+            proc.set_source_queue(level);
+            let chunk = AudioChunk::new(vec![0.25f32; 882], 44100, 2, at);
+            at += chunk.duration();
+            proc.process_chunk(&chunk, DEFAULT_RING_BUFFER_PACKETS, &mut packets)
+                .unwrap();
+            if i < 10 {
+                assert_eq!(metrics.snapshot().applied_correction_ppm, 0.0);
+            }
+        }
+        assert!(metrics.snapshot().applied_correction_ppm > 0.0);
     }
 }

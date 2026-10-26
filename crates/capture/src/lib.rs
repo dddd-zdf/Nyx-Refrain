@@ -20,7 +20,9 @@ pub mod wasapi;
 pub use discontinuity::{DiscontinuityStats, DiscontinuityTracker};
 pub use format::{SampleFormat, WaveFormatInfo};
 pub use rebuild::{RebuildState, RebuildStateMachine};
-pub use sources::{FileWavSource, SilenceSource, SineSource, StdinFormat, StdinSource, WavSource};
+pub use sources::{
+    FileWavSource, LiveStdinSource, SilenceSource, SineSource, StdinFormat, StdinSource, WavSource,
+};
 pub use time_map::QpcTimestampMapper;
 
 #[cfg(windows)]
@@ -159,6 +161,14 @@ pub trait AudioSource: Send {
     /// Signal raised whenever new audio is queued, so readers can block instead of polling.
     /// `None` (the default) means the reader must poll.
     fn data_signal(&self) -> Option<Arc<DataSignal>> {
+        None
+    }
+
+    /// For sources whose audio arrives on another device's clock but is read on demand from a
+    /// jitter queue (live stdin): the frames that queue held before the latest read. The
+    /// pipeline then steers its resampler to keep the queue level steady. `None` (the default)
+    /// for other sources, and while such a source is still buffering.
+    fn queue_frames(&self) -> Option<usize> {
         None
     }
 
