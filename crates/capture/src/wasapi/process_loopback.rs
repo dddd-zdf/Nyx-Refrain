@@ -57,8 +57,10 @@ fn capture_format() -> WAVEFORMATEX {
     }
 }
 
-/// Engine buffer for the capture client, in 100 ns units (20 ms, as in the sample).
-const CAPTURE_BUFFER_HNS: i64 = 200_000;
+/// Engine buffer for the capture client, in 100 ns units (100 ms). The sample's 20 ms held
+/// only two 10 ms packets, so a capture wake-up ~20 ms late lost audio (heard as a click).
+/// Packets are still read as soon as each arrives, so this adds no latency.
+const CAPTURE_BUFFER_HNS: i64 = 1_000_000;
 
 /// Filtering mode for process-specific loopback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
