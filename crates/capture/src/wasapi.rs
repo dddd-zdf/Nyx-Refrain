@@ -71,18 +71,14 @@ impl WakeDiag {
     }
 
     /// Checks that a packet starting at device position `pos` follows on from the previous
-    /// one and returns the frames skipped in between; a position that went backwards (a new
-    /// stream) just restarts the check.
-    pub(crate) fn position(&mut self, pos: u64, frames: u32) -> u64 {
-        let skipped = match self.next_pos {
-            Some(next) if pos > next => pos - next,
-            _ => 0,
-        };
-        if skipped > 0 {
-            DIAG_CAPTURE_SKIPPED_FRAMES.fetch_add(skipped, std::sync::atomic::Ordering::Relaxed);
+    /// one; a position that went backwards (a new stream) just restarts the check.
+    pub(crate) fn position(&mut self, pos: u64, frames: u32) {
+        if let Some(next) = self.next_pos
+            && pos > next
+        {
+            DIAG_CAPTURE_SKIPPED_FRAMES.fetch_add(pos - next, std::sync::atomic::Ordering::Relaxed);
         }
         self.next_pos = Some(pos + frames as u64);
-        skipped
     }
 
     pub(crate) fn done(&self) {
@@ -106,29 +102,6 @@ pub(crate) fn push_frames(
         chunk.fill_from_iter(samples[..n].iter().copied());
     }
     samples.len() - n
-}
-
-/// Queues `frames` frames of silence in place of audio Windows skipped, so later audio keeps
-/// its place in time (the stream is clocked from frame counts); returns samples dropped.
-/// Skips over a second long are a new stream, not a gap, and are ignored.
-pub(crate) fn push_silence(
-    producer: &mut rtrb::Producer<f32>,
-    frames: u64,
-    sample_rate: u32,
-    channels: usize,
-) -> usize {
-    if frames == 0 || frames > sample_rate as u64 {
-        return 0;
-    }
-    let channels = channels.max(1);
-    let wanted = frames as usize * channels;
-    let n = wanted.min(producer.slots()) / channels * channels;
-    if n > 0
-        && let Ok(chunk) = producer.write_chunk_uninit(n)
-    {
-        chunk.fill_from_iter(std::iter::repeat(0.0));
-    }
-    wanted - n
 }
 
 /// Appends up to `max_samples` queued samples, whole frames only, to `out` in one block.

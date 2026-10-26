@@ -159,19 +159,6 @@ struct Conn {
 /// metadata is disabled for the session.
 const METADATA_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How far the RTP time in sync packets trails the capture clock in a capture-clocked
-/// stream. A packet is ready about 8 ms (its own length) plus up to one 10 ms capture period
-/// after its first frame was captured; trailing by more than that means every packet goes out
-/// before its RTP time comes up, as a timer-paced stream sends it, with no queue in between.
-const CAPTURE_SEND_LEAD: Duration = Duration::from_millis(20);
-
-/// RTP time "now" of a capture-clocked stream; `None` until its first audio.
-fn capture_rtp_now(clock: &pipeline::CaptureClock, rtp0: u32, now: Instant) -> Option<u32> {
-    let t = now.checked_sub(CAPTURE_SEND_LEAD)?;
-    let frames = clock.output_frames_at(t)?.max(0.0);
-    Some(rtp0.wrapping_add(frames as u64 as u32))
-}
-
 /// How long the keep-alive and volume requests wait for the receiver. The engine awaits them
 /// in its command loop, so an unbounded wait on a receiver that stopped answering (heavy
 /// Wi-Fi loss) froze the app: no reconnect, and Stop did nothing. A timed-out keep-alive
@@ -552,9 +539,6 @@ pub struct Ap2Session {
     conn: Conn,
     clock: Clock,
     start_at: Instant,
-    rtp0: u32,
-    /// Set when the stream is clocked by the capture device (see [`pipeline::CaptureClock`]).
-    capture_clock: Option<Arc<pipeline::CaptureClock>>,
     uri: String,
     stop: Arc<AtomicBool>,
     threads: Vec<std::thread::JoinHandle<()>>,
@@ -571,19 +555,11 @@ pub struct Ap2Session {
 }
 
 impl Ap2Session {
-    /// Pairs, sets up and starts streaming PCM produced by `source`, called on the sender
-    /// thread (must not block) and returning whether it wrote a packet.
-    ///
-    /// Without `capture_clock`, packets are paced by the sender's timer and `source` is called
-    /// once per 352 frames (it must always write one). With it, `source` is polled and each
-    /// packet goes out as soon as it is ready; sync packets carry the capture clock.
-    pub async fn start<F>(
-        cfg: Ap2Config,
-        capture_clock: Option<Arc<pipeline::CaptureClock>>,
-        mut source: F,
-    ) -> Result<Self, Ap2Error>
+    /// Pairs, sets up and starts streaming PCM produced by `source` (called once per
+    /// 352-frame packet on the sender thread; must not block).
+    pub async fn start<F>(cfg: Ap2Config, mut source: F) -> Result<Self, Ap2Error>
     where
-        F: FnMut(&mut [i16; SAMPLES_PER_PACKET]) -> bool + Send + 'static,
+        F: FnMut(&mut [i16; SAMPLES_PER_PACKET]) + Send + 'static,
     {
         let (bind_ip, iface_index) =
             resolve_local(cfg.target, cfg.local_ip, cfg.interface_name.as_deref());
@@ -926,7 +902,6 @@ impl Ap2Session {
             let latency = cfg.latency_frames as u32; // two's complement for negative values
             let sync_flag = cfg.sync_flag;
             let history = history.clone();
-            let capture = capture_clock.clone();
             sock.set_read_timeout(Some(Duration::from_millis(50)))?;
             threads.push(
                 std::thread::Builder::new()
@@ -941,13 +916,8 @@ impl Ap2Session {
                         let mut next = start_at;
                         while !stop.load(Ordering::Relaxed) {
                             let now = Instant::now();
-                            let rtp_now = match &capture {
-                                Some(c) => capture_rtp_now(c, rtp0, now),
-                                None => Some(clock.rtp_ts(now.max(start_at))),
-                            };
-                            if now >= next
-                                && let Some(rtp_now) = rtp_now
-                            {
+                            if now >= next {
+                                let rtp_now = clock.rtp_ts(now.max(start_at));
                                 build_sync_packet(
                                     first,
                                     sync_flag,
@@ -1009,7 +979,6 @@ impl Ap2Session {
             let stats = stats.clone();
             let prefill = Duration::from_millis(cfg.prefill_ms as u64);
             let history = history.clone();
-            let capture = capture_clock.clone();
             let guard = quiet_guard.clone();
             threads.push(std::thread::Builder::new().name("ap2-audio".into()).spawn(
                 move || {
@@ -1021,44 +990,28 @@ impl Ap2Session {
                     let mut packet = [0u8; 12 + PCM_BYTES + AUDIO_TRAILER_LEN];
                     let ssrc: u32 = rand::random();
                     let mut idx: u64 = 0;
-                    if let Some(c) = &capture {
-                        c.start();
-                    }
                     while !stop.load(Ordering::Relaxed) {
-                        let ts = rtp0.wrapping_add((idx * FRAMES_PER_PACKET as u64) as u32);
-                        let late_frames = match &capture {
-                            Some(c) => {
-                                if !source(&mut pcm) {
-                                    c.packets_ready.wait(Duration::from_millis(5));
-                                    continue;
-                                }
-                                // How far past its RTP time the packet goes out (negative:
-                                // early, as it should be).
-                                capture_rtp_now(c, rtp0, Instant::now())
-                                    .map_or(0, |now| now.wrapping_sub(ts) as i32)
-                            }
-                            None => {
-                                let nominal = start_at
-                                    + frames_to_duration(
-                                        idx * FRAMES_PER_PACKET as u64,
-                                        SAMPLE_RATE as u32,
-                                    );
-                                let send_at = nominal.checked_sub(prefill).unwrap_or(nominal);
-                                if send_at > Instant::now() {
-                                    pipeline::wait_until(send_at);
-                                }
-                                let late = Instant::now().saturating_duration_since(send_at);
-                                source(&mut pcm);
-                                (late.as_micros() as u64 * SAMPLE_RATE / 1_000_000) as i32
-                            }
-                        };
-                        let late_us = late_frames.max(0) as u64 * 1_000_000 / SAMPLE_RATE;
-                        stats.send_late_max_us.fetch_max(late_us, Ordering::Relaxed);
+                        let nominal = start_at
+                            + frames_to_duration(
+                                idx * FRAMES_PER_PACKET as u64,
+                                SAMPLE_RATE as u32,
+                            );
+                        let send_at = nominal.checked_sub(prefill).unwrap_or(nominal);
+                        let now = Instant::now();
+                        if send_at > now {
+                            pipeline::wait_until(send_at);
+                        }
+                        let late = Instant::now().saturating_duration_since(send_at);
+                        stats
+                            .send_late_max_us
+                            .fetch_max(late.as_micros() as u64, Ordering::Relaxed);
+                        source(&mut pcm);
                         guard.process_s16(&mut pcm);
                         for (i, s) in pcm.iter().enumerate() {
                             payload[2 * i..2 * i + 2].copy_from_slice(&s.to_be_bytes());
                         }
                         let seq = seq0.wrapping_add(idx as u16);
+                        let ts = rtp0.wrapping_add((idx * FRAMES_PER_PACKET as u64) as u32);
                         write_rtp_header(idx == 0, seq, ts, ssrc, &mut header);
                         let n = cipher.seal(&header, &payload, &mut packet);
                         history.insert(seq, &packet[..n]);
@@ -1078,8 +1031,6 @@ impl Ap2Session {
             conn,
             clock,
             start_at,
-            rtp0,
-            capture_clock,
             uri,
             stop,
             threads,
@@ -1105,10 +1056,6 @@ impl Ap2Session {
         ring_capacity: usize,
     ) -> Result<Self, Ap2Error> {
         let source_is_live = source.is_live();
-        // Sources with real capture timestamps clock the stream themselves; others are paced.
-        let capture_clock = source
-            .has_capture_timestamps()
-            .then(|| Arc::new(pipeline::CaptureClock::new()));
         let (producer, mut consumer) =
             rtrb::RingBuffer::<[i16; SAMPLES_PER_PACKET]>::new(ring_capacity);
         let feeder_stop = Arc::new(AtomicBool::new(false));
@@ -1118,57 +1065,36 @@ impl Ap2Session {
             metrics.clone(),
             feeder_stop.clone(),
             Duration::from_millis(50),
-            capture_clock.clone(),
         )?;
         let rt_metrics = metrics.clone();
         let live = source_is_live;
-        let clocked = capture_clock.is_some();
         let mut recorder = pipeline::sent_recorder::SentRecorder::from_env();
-        let started = Self::start(
-            cfg,
-            capture_clock,
-            move |pcm: &mut [i16; SAMPLES_PER_PACKET]| {
-                rt_metrics.record_ring_peak(consumer.slots());
-                if clocked {
-                    // Sent as soon as ready: nothing piles up, so nothing is trimmed.
-                    return match consumer.pop() {
-                        Ok(p) => {
-                            *pcm = p;
-                            if let Some(r) = &mut recorder {
-                                r.record(pcm);
-                            }
-                            rt_metrics.record_packet_sent();
-                            true
-                        }
-                        Err(_) => false,
-                    };
+        let started = Self::start(cfg, move |pcm: &mut [i16; SAMPLES_PER_PACKET]| {
+            rt_metrics.record_ring_peak(consumer.slots());
+            if live {
+                // Keep latency bounded: drop backlog beyond a few packets (see
+                // AudioSource::is_live). No allocation, no locks.
+                let mut dropped = 0u64;
+                while consumer.slots() > LIVE_MAX_BUFFERED_PACKETS {
+                    let _ = consumer.pop();
+                    dropped += 1;
                 }
-                if live {
-                    // Keep latency bounded: drop backlog beyond a few packets (see
-                    // AudioSource::is_live). No allocation, no locks.
-                    let mut dropped = 0u64;
-                    while consumer.slots() > LIVE_MAX_BUFFERED_PACKETS {
-                        let _ = consumer.pop();
-                        dropped += 1;
-                    }
-                    if dropped > 0 {
-                        rt_metrics.record_packets_dropped(dropped);
-                    }
+                if dropped > 0 {
+                    rt_metrics.record_packets_dropped(dropped);
                 }
-                match consumer.pop() {
-                    Ok(p) => *pcm = p,
-                    Err(_) => {
-                        pcm.fill(0);
-                        rt_metrics.record_glitch(pipeline::Glitch::SenderStarved);
-                    }
+            }
+            match consumer.pop() {
+                Ok(p) => *pcm = p,
+                Err(_) => {
+                    pcm.fill(0);
+                    rt_metrics.record_glitch(pipeline::Glitch::SenderStarved);
                 }
-                if let Some(r) = &mut recorder {
-                    r.record(pcm);
-                }
-                rt_metrics.record_packet_sent();
-                true
-            },
-        )
+            }
+            if let Some(r) = &mut recorder {
+                r.record(pcm);
+            }
+            rt_metrics.record_packet_sent();
+        })
         .await;
         match started {
             Ok(mut s) => {
@@ -1238,10 +1164,7 @@ impl Ap2Session {
 
     /// Returns the 44.1 kHz RTP timestamp for "now" aligned to the session timeline.
     pub fn rtp_now(&self) -> u32 {
-        match &self.capture_clock {
-            Some(c) => capture_rtp_now(c, self.rtp0, Instant::now()).unwrap_or(self.rtp0),
-            None => self.clock.rtp_ts(Instant::now().max(self.start_at)),
-        }
+        self.clock.rtp_ts(Instant::now().max(self.start_at))
     }
 
     /// Helper giving the RTP timestamp for "now".

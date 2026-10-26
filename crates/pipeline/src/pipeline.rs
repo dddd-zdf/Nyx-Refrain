@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use capture::{AudioChunk, AudioSource};
 
-use crate::capture_clock::{CaptureClock, ClockUpdate, Dll};
 use crate::convert::{TpdfDither, downmix_to_stereo};
 use crate::drift::{DriftCompensator, DriftConfig};
 use crate::metrics::{Glitch, SharedPipelineMetrics};
@@ -37,8 +36,6 @@ pub struct PipelineProcessor {
     drift: DriftCompensator,
     /// Steer the queue fill (live sources); paced sources keep the nominal ratio.
     steer: bool,
-    /// Fill gaps between chunks with silence; off when the caller keeps the timeline.
-    bridge_gaps: bool,
     dither: TpdfDither,
     underrun_timeout: Duration,
     last_chunk_time: Option<Instant>,
@@ -84,7 +81,6 @@ impl PipelineProcessor {
             resampler,
             drift,
             steer: false,
-            bridge_gaps: true,
             dither: TpdfDither::default(),
             underrun_timeout: underrun_timeout
                 .unwrap_or(Duration::from_millis(DEFAULT_UNDERRUN_TIMEOUT_MS)),
@@ -94,21 +90,6 @@ impl PipelineProcessor {
             staging_s16: Vec::with_capacity(ALAC_PCM_SAMPLES * 4),
             metrics,
         })
-    }
-
-    /// Leaves gaps between chunks to the caller (see [`start_pipeline_feeder`] with a clock).
-    pub fn set_bridge_gaps(&mut self, bridge: bool) {
-        self.bridge_gaps = bridge;
-    }
-
-    /// Processes `frames` frames of silence, keeping the stream's place in time.
-    pub fn process_silence(
-        &mut self,
-        frames: usize,
-        packets_out: &mut Vec<[i16; ALAC_PCM_SAMPLES]>,
-    ) -> Result<(), String> {
-        let silence = vec![0.0f32; frames * 2];
-        self.process_stereo_f32(&silence, packets_out)
     }
 
     /// Reset internal state.
@@ -133,8 +114,7 @@ impl PipelineProcessor {
         let now = chunk.timestamp;
 
         // Check for source underrun
-        if self.bridge_gaps
-            && let Some(last_time) = self.last_chunk_time
+        if let Some(last_time) = self.last_chunk_time
             && now > last_time
         {
             let gap = now.duration_since(last_time);
@@ -235,36 +215,15 @@ impl PipelineProcessor {
 
 /// Spawns the background audio pipeline feeder thread that reads from `AudioSource`,
 /// processes through `PipelineProcessor`, and pushes 352-frame packets into `rtrb::Producer`.
-///
-/// With a `clock` the stream is clocked from the capture timestamps (see
-/// [`crate::capture_clock`]): packets are queued as soon as they are ready, for a sender that
-/// sends them at once. Without one, a sender pacing on its own timer pulls them.
 pub fn start_pipeline_feeder(
     mut source: Box<dyn AudioSource + Send>,
     mut producer: rtrb::Producer<[i16; ALAC_PCM_SAMPLES]>,
     metrics: SharedPipelineMetrics,
     stop_signal: Arc<AtomicBool>,
     underrun_timeout: Duration,
-    clock: Option<Arc<CaptureClock>>,
 ) -> Result<std::thread::JoinHandle<()>, std::io::Error> {
     let sample_rate = source.sample_rate();
     let _channels = source.channels();
-
-    if let Some(clock) = clock {
-        return std::thread::Builder::new()
-            .name("nyx-refrain-feeder".into())
-            .spawn(move || {
-                let _priority = capture::enter_audio_thread_priority();
-                run_clocked_feeder(
-                    source,
-                    producer,
-                    metrics,
-                    stop_signal,
-                    underrun_timeout,
-                    clock,
-                );
-            });
-    }
 
     std::thread::Builder::new()
         .name("nyx-refrain-feeder".into())
@@ -380,141 +339,6 @@ pub fn start_pipeline_feeder(
 
             let _ = source.stop();
         })
-}
-
-/// Feeder loop of a capture-clocked stream. Every input frame, captured or made up, has its
-/// place on the capture clock: a break in delivery is filled with silence of the same length,
-/// so the frame count and the clock never part.
-fn run_clocked_feeder(
-    mut source: Box<dyn AudioSource + Send>,
-    mut producer: rtrb::Producer<[i16; ALAC_PCM_SAMPLES]>,
-    metrics: SharedPipelineMetrics,
-    stop_signal: Arc<AtomicBool>,
-    underrun_timeout: Duration,
-    clock: Arc<CaptureClock>,
-) {
-    let sample_rate = source.sample_rate();
-    let mut processor = match PipelineProcessor::new(sample_rate, metrics.clone(), None) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!("Failed to initialize PipelineProcessor: {e}");
-            return;
-        }
-    };
-    processor.set_bridge_gaps(false);
-    let _ = source.start();
-    let data_signal = source.data_signal();
-    let read_frames = (sample_rate / 100).max(128) as usize;
-
-    let epoch = Instant::now();
-    let secs = |t: Instant| {
-        if t >= epoch {
-            t.duration_since(epoch).as_secs_f64()
-        } else {
-            -epoch.duration_since(t).as_secs_f64()
-        }
-    };
-    let mut dll: Option<Dll> = None;
-    // Input frames so far, captured or made up; `n_start` is output frame 0.
-    let mut n: u64 = 0;
-    let mut n_start: Option<u64> = None;
-    let mut batch = Vec::with_capacity(8);
-    let mut last_activity = Instant::now();
-
-    let queue = |batch: &mut Vec<[i16; ALAC_PCM_SAMPLES]>,
-                 producer: &mut rtrb::Producer<[i16; ALAC_PCM_SAMPLES]>| {
-        let mut dropped = 0;
-        for pkt in batch.drain(..) {
-            if producer.push(pkt).is_err() {
-                dropped += 1;
-            }
-        }
-        if dropped > 0 {
-            metrics.record_packets_dropped(dropped);
-        }
-        metrics.set_buffer_fill(DEFAULT_RING_BUFFER_PACKETS.saturating_sub(producer.slots()));
-        clock.packets_ready.notify();
-    };
-
-    while !stop_signal.load(Ordering::Relaxed) {
-        let mut idle = false;
-        match source.read_chunk(read_frames) {
-            Ok(Some(chunk)) => {
-                metrics.record_feeder_gap(last_activity.elapsed());
-                last_activity = Instant::now();
-                let t = secs(chunk.timestamp);
-                let d = dll.get_or_insert_with(|| Dll::new(sample_rate, n as f64, t));
-                match d.update(n as f64, t) {
-                    ClockUpdate::Tracked => {}
-                    ClockUpdate::Late(e) => {
-                        // Audio missing before this chunk: make up its length in silence.
-                        let missing = ((e * sample_rate as f64) as u64).min(sample_rate as u64);
-                        if n_start.is_some() {
-                            metrics.record_glitch(Glitch::CaptureGap);
-                            let _ = processor.process_silence(missing as usize, &mut batch);
-                        }
-                        n += missing;
-                        d.update(n as f64, t);
-                    }
-                    ClockUpdate::Early(_) => {
-                        if n_start.is_some() {
-                            metrics.record_glitch(Glitch::CaptureGap);
-                        }
-                    }
-                }
-                if n_start.is_none() && clock.is_started() {
-                    // The stream starts here, with fresh audio: nothing captured before the
-                    // receiver was ready is sent.
-                    processor.reset();
-                    batch.clear();
-                    n_start = Some(n);
-                }
-                if n_start.is_some() {
-                    let _ = processor.process_chunk(&chunk, 0, &mut batch);
-                }
-                n += chunk.frame_count() as u64;
-                if let (Some(start), Some(d)) = (n_start, &dll) {
-                    clock.publish(d, epoch, start as f64, sample_rate);
-                    metrics.set_drift_ppm(d.rate_ppm(), 0.0);
-                    queue(&mut batch, &mut producer);
-                }
-            }
-            Ok(None) => idle = true,
-            Err(e) => {
-                tracing::warn!("Error reading from AudioSource: {e}");
-                metrics.record_discontinuity();
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-
-        // The source went quiet: keep the stream moving with silence up to the clock, less a
-        // period's margin so audio arriving late is not overtaken.
-        if last_activity.elapsed() >= underrun_timeout
-            && let (Some(_), Some(d)) = (n_start, &dll)
-        {
-            let behind = secs(Instant::now()) - d.time_of(n as f64) - 0.010;
-            let frames = ((behind * sample_rate as f64).max(0.0) as u64).min(sample_rate as u64);
-            if frames > 0 {
-                metrics.record_glitch(Glitch::SourceSilent);
-                let _ = processor.process_silence(frames as usize, &mut batch);
-                n += frames;
-                queue(&mut batch, &mut producer);
-            }
-            last_activity = Instant::now();
-        }
-
-        match &data_signal {
-            Some(_) if !idle => {}
-            Some(signal) => signal.wait(
-                underrun_timeout
-                    .saturating_sub(last_activity.elapsed())
-                    .clamp(Duration::from_millis(1), Duration::from_millis(10)),
-            ),
-            None => std::thread::sleep(Duration::from_millis(if idle { 7 } else { 2 })),
-        }
-    }
-
-    let _ = source.stop();
 }
 
 #[cfg(test)]

@@ -232,10 +232,6 @@ impl AudioSource for WasapiLoopbackSource {
         true
     }
 
-    fn has_capture_timestamps(&self) -> bool {
-        true
-    }
-
     fn data_signal(&self) -> Option<Arc<crate::DataSignal>> {
         Some(self.data_signal.clone())
     }
@@ -471,13 +467,7 @@ fn run_capture_loop(
                     break;
                 }
                 wake.frames(num_frames);
-                let skipped = wake.position(device_pos, num_frames);
-                super::push_silence(
-                    &mut producer,
-                    skipped,
-                    session.format_info.sample_rate,
-                    session.format_info.channels as usize,
-                );
+                wake.position(device_pos, num_frames);
 
                 // Discontinuity accounting
                 let mut mapped_flags = 0u32;

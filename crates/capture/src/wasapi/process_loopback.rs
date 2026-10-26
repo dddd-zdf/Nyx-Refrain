@@ -249,10 +249,6 @@ impl AudioSource for ProcessLoopbackSource {
         true
     }
 
-    fn has_capture_timestamps(&self) -> bool {
-        true
-    }
-
     fn data_signal(&self) -> Option<Arc<crate::DataSignal>> {
         Some(self.data_signal.clone())
     }
@@ -511,13 +507,7 @@ fn run_process_capture_loop(
                     break;
                 }
                 wake.frames(num_frames);
-                let skipped = wake.position(device_pos, num_frames);
-                super::push_silence(
-                    &mut producer,
-                    skipped,
-                    format_info.sample_rate,
-                    format_info.channels as usize,
-                );
+                wake.position(device_pos, num_frames);
 
                 let mut mapped_flags = 0u32;
                 if (flags & (AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32)) != 0 {
