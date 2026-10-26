@@ -40,6 +40,8 @@ pub struct StartParams {
     pub capture_mode: crate::settings::CaptureMode,
     /// Mute this PC's speakers while streaming (Windows, per-process capture only).
     pub mute_local: bool,
+    /// Output (endpoint ID) to make the default while streaming (Windows).
+    pub stream_output: Option<String>,
 }
 
 pub enum Cmd {
@@ -55,6 +57,7 @@ pub enum Cmd {
     SetSendNowPlaying(bool),
     SetRemoteControl(bool),
     SetMuteLocal(bool),
+    SetStreamOutput(Option<String>),
     Discover,
     CheckFirewall,
     #[allow(dead_code)]
@@ -263,6 +266,7 @@ fn resume_params(
         remote_control: s.remote_control,
         capture_mode: s.capture_mode,
         mute_local: s.mute_local,
+        stream_output: s.stream_output.clone(),
     })
 }
 
@@ -356,6 +360,58 @@ fn set_local_mute(
     }
     #[cfg(not(windows))]
     let _ = (mute, want, settings);
+}
+
+#[cfg(windows)]
+type OutputSwitch = capture::wasapi::DefaultOutputGuard;
+#[cfg(not(windows))]
+type OutputSwitch = ();
+
+/// Makes `want` (an endpoint ID) the default output, or switches back to the output it
+/// replaced, also when an earlier run switched and exited without switching back
+/// ([`Settings::switched_output`]).
+///
+/// [`Settings::switched_output`]: crate::settings::Settings::switched_output
+fn set_stream_output(
+    switch: &mut Option<OutputSwitch>,
+    want: Option<&str>,
+    settings: &Option<Arc<Mutex<crate::settings::Settings>>>,
+) {
+    #[cfg(windows)]
+    {
+        let left = settings
+            .as_ref()
+            .and_then(|s| s.lock().ok().and_then(|s| s.switched_output.clone()));
+        if switch.is_none()
+            && let Some(left) = left
+        {
+            *switch = Some(OutputSwitch::adopt(left.to, left.from));
+        }
+        if switch.as_ref().is_some_and(|g| want != Some(g.target_id())) {
+            *switch = None;
+        }
+        if switch.is_none()
+            && let Some(id) = want
+        {
+            match OutputSwitch::switch_to(id) {
+                Ok(g) => *switch = g,
+                Err(e) => tracing_like_warn(&format!("switching the default output failed: {e}")),
+            }
+        }
+        let switched = switch.as_ref().map(|g| crate::settings::SwitchedOutput {
+            from: g.previous_id().to_string(),
+            to: g.target_id().to_string(),
+        });
+        if let Some(s) = settings
+            && let Ok(mut s) = s.lock()
+            && s.switched_output != switched
+        {
+            s.switched_output = switched;
+            s.save();
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (switch, want, settings);
 }
 
 #[cfg(target_os = "linux")]
@@ -553,6 +609,7 @@ async fn run(
     let mut last_sent_track: Option<nowplaying::NowPlaying> = None;
     let mut settings_ref: Option<Arc<Mutex<crate::settings::Settings>>> = None;
     let mut local_mute: Option<LocalMute> = None;
+    let mut output_switch: Option<OutputSwitch> = None;
     #[cfg(target_os = "linux")]
     let mut last_receiver_vol: Option<f32> = None;
     let mut feedback = tokio::time::interval(Duration::from_secs(2));
@@ -590,8 +647,9 @@ async fn run(
                             resume = Some(Resume::new(Instant::now()));
                             set_state(&shared, &*notifier, State::Connecting);
                         } else if running.is_none() {
-                            // Not resuming: unmute speakers an earlier run left muted.
+                            // Not resuming: undo what an earlier run left in place.
                             set_local_mute(&mut local_mute, false, &settings_ref);
+                            set_stream_output(&mut output_switch, None, &settings_ref);
                         }
                     }
                     Cmd::Start(p) => {
@@ -620,7 +678,15 @@ async fn run(
                         // output) before connecting, so an unreachable device would silence the
                         // desktop for a whole connect timeout.
                         let started = match reachable(p.device.addr).await {
-                            Ok(()) => start(&p, &mut kept).await,
+                            Ok(()) => {
+                                // Before capturing, so device loopback opens the new default.
+                                set_stream_output(
+                                    &mut output_switch,
+                                    p.stream_output.as_deref(),
+                                    &settings_ref,
+                                );
+                                start(&p, &mut kept).await
+                            }
                             Err(e) => Err(e),
                         }
                         .map_err(|e| explain_not_local(p.device.addr, e));
@@ -673,6 +739,7 @@ async fn run(
                                 _ => {
                                     kept = None;
                                     set_local_mute(&mut local_mute, false, &settings_ref);
+                                    set_stream_output(&mut output_switch, None, &settings_ref);
                                     set_state(&shared, &*notifier, State::Error(e));
                                 }
                             },
@@ -685,6 +752,7 @@ async fn run(
                         resume = None;
                         // First: quitting waits only briefly for the engine.
                         set_local_mute(&mut local_mute, false, &settings_ref);
+                        set_stream_output(&mut output_switch, None, &settings_ref);
                         if let Some(r) = running.take() {
                             r.stop().await;
                         }
@@ -753,6 +821,14 @@ async fn run(
                     Cmd::SetRemoteControl(enabled) => {
                         if let Some(r) = running.as_mut() {
                             r.remote_control = enabled;
+                        }
+                    }
+                    Cmd::SetStreamOutput(id) => {
+                        if let Some(r) = running.as_mut() {
+                            r.params.stream_output = id.clone();
+                            set_stream_output(&mut output_switch, id.as_deref(), &settings_ref);
+                        } else if id.is_none() {
+                            set_stream_output(&mut output_switch, None, &settings_ref);
                         }
                     }
                     Cmd::SetMuteLocal(enabled) => {
@@ -828,6 +904,7 @@ async fn run(
                         resume = None;
                         kept = None;
                         set_local_mute(&mut local_mute, false, &settings_ref);
+                        set_stream_output(&mut output_switch, None, &settings_ref);
                         set_state(&shared, &*notifier, State::Error(e));
                     } else if now >= r.next_attempt {
                         let settings = settings_ref
@@ -842,6 +919,9 @@ async fn run(
                             Some(p) => Some(StartParams {
                                 volume_pct: settings.as_ref().map_or(p.volume_pct, |s| s.volume_pct),
                                 mute_local: settings.as_ref().map_or(p.mute_local, |s| s.mute_local),
+                                stream_output: settings
+                                    .as_ref()
+                                    .map_or(p.stream_output.clone(), |s| s.stream_output.clone()),
                                 ..p.clone()
                             }),
                             None => settings.and_then(|s| {

@@ -68,11 +68,15 @@ pub enum Key {
     MuteLocalHint,
     Settings,
     Back,
+    StreamOutput,
+    StreamOutputHint,
+    StreamOutputOff,
+    StreamOutputMissing,
 }
 
 impl Key {
     #[allow(dead_code)]
-    pub const ALL: [Key; 57] = [
+    pub const ALL: [Key; 61] = [
         Key::AppName,
         Key::StateIdle,
         Key::StateConnecting,
@@ -130,6 +134,10 @@ impl Key {
         Key::MuteLocalHint,
         Key::Settings,
         Key::Back,
+        Key::StreamOutput,
+        Key::StreamOutputHint,
+        Key::StreamOutputOff,
+        Key::StreamOutputMissing,
     ];
 }
 
@@ -294,6 +302,18 @@ pub fn t(lang: Lang, key: Key) -> &'static str {
         (Lang::En, Key::MuteLocalHint) => {
             "So this PC and the speaker don't play out of sync; unmuted when streaming stops. Not available with device loopback capture"
         }
+        (Lang::ZhCn, Key::StreamOutput) => "推流时输出到",
+        (Lang::En, Key::StreamOutput) => "While streaming, play through",
+        (Lang::ZhCn, Key::StreamOutputHint) => {
+            "推流时把它设为默认输出设备，停止后切回。选一个不出声的设备（没有扬声器的显示器、VB-CABLE），配合设备回环采集，本机就保持安静"
+        }
+        (Lang::En, Key::StreamOutputHint) => {
+            "Makes this the default output while streaming and switches back when it stops. With device loopback capture, pick one with no speakers (a monitor without speakers, VB-CABLE) to keep this PC silent"
+        }
+        (Lang::ZhCn, Key::StreamOutputOff) => "不切换",
+        (Lang::En, Key::StreamOutputOff) => "Don't switch",
+        (Lang::ZhCn, Key::StreamOutputMissing) => "（未连接）",
+        (Lang::En, Key::StreamOutputMissing) => "(not connected)",
     }
 }
 
