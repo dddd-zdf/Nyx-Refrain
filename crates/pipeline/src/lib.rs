@@ -3,14 +3,17 @@
 //! Handles lock-free SPSC ring buffers, format conversion, runtime resampling,
 //! clock drift compensation, 352-frame packet chunking, and silence padding.
 
+pub mod capture_clock;
 pub mod convert;
 pub mod drift;
 pub mod metrics;
 pub mod pipeline;
 pub mod quiet;
 pub mod resample;
+pub mod sent_recorder;
 pub mod timer;
 
+pub use capture_clock::CaptureClock;
 pub use convert::{TpdfDither, Xorshift64, downmix_to_stereo};
 pub use drift::{DriftCompensator, DriftConfig, MAX_DRIFT_CORRECTION_PPM};
 pub use metrics::{

@@ -6,6 +6,14 @@
 //! - Quantization: 32-bit floating point `[-1.0, 1.0]` to 16-bit signed integer
 //!   `[-32768, 32767]` with Triangular Probability Density Function (TPDF) dither.
 
+/// Samples quantized at full scale because they were louder than it (heard as crackle);
+/// read by the audio watcher.
+pub static DIAG_CLIPPED_SAMPLES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Loudest quantized sample since last reset, as `f32` bits (1.0 = full scale). Positive
+/// floats order like their bits, so `fetch_max` works on them.
+pub static DIAG_PEAK_F32_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Standard ITU-R BS.775 center / surround attenuation coefficient: 1 / sqrt(2) ≈ 0.70710678.
 pub const DOWNMIX_ATTENUATION_3DB: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
@@ -236,9 +244,20 @@ impl TpdfDither {
     /// Quantize a slice of normalized `f32` samples into `output` `i16` buffer with TPDF dither.
     #[inline]
     pub fn quantize_slice(&mut self, input: &[f32], output: &mut [i16]) {
+        use std::sync::atomic::Ordering::Relaxed;
         let len = input.len().min(output.len());
+        let mut peak = 0.0f32;
         for i in 0..len {
+            peak = peak.max(input[i].abs());
             output[i] = self.quantize_sample(input[i]);
+        }
+        // Counted once per slice: no per-sample atomics on the audio path.
+        if peak > 1.0 {
+            let clipped = input[..len].iter().filter(|s| s.abs() > 1.0).count();
+            DIAG_CLIPPED_SAMPLES.fetch_add(clipped as u64, Relaxed);
+        }
+        if peak.is_finite() {
+            DIAG_PEAK_F32_BITS.fetch_max(peak.to_bits(), Relaxed);
         }
     }
 }

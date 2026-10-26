@@ -21,14 +21,18 @@ const LEGEND: &str = "\
 # gap      capture chunks arrived >= 50 ms apart; silence bridged the gap
 # silent   the source delivered nothing for 50 ms; a silent packet was queued
 # wasapi   Windows flagged a break in the captured audio
+# skipped  frames Windows never handed over (lost before capture, or its buffer overflowed)
 # overflow captured frames dropped because the capture buffer was full
 # resend   packets the speaker asked for again (network loss)
+# clipped  samples louder than full scale, cut off at the limit (crackle on loud parts)
+# timer    send-timer waits that ran out at the 50 ms fallback instead of firing
 # late     largest delay past a packet's scheduled send time (flagged from 5 ms)
 # Where a clump of audio comes from (largest per line):
 # win_burst  frames Windows handed over in one capture wake-up (480 = one 10 ms packet)
 # win_gap    time between capture wake-ups (about 10 ms is normal)
 # feed_gap   time between feeder reads that got audio (about 10 ms is normal)
 # ring_peak  packets queued when the sender took one (above 8 means a trim)
+# peak       loudest sample sent (1.00 = full scale; above it clips)
 # Drift steering:
 # nudge    speed correction applied right now (ppm; 500 = 0.05%)
 # learned  steady clock difference it has learned (ppm)";
@@ -41,18 +45,22 @@ struct Counts {
     glitches: GlitchCounts,
     wasapi: u64,
     overflow: u64,
+    skipped: u64,
+    clipped: u64,
+    timer: u64,
 }
 
 impl Counts {
     fn read(metrics: &PipelineMetricsTracker, stats: &Ap2Stats) -> Self {
         let snap = metrics.snapshot();
         #[cfg(windows)]
-        let (wasapi, overflow) = (
+        let (wasapi, overflow, skipped) = (
             capture::wasapi::DIAG_WASAPI_GLITCHES.load(Ordering::Relaxed),
             capture::wasapi::DIAG_CAPTURE_OVERFLOW_FRAMES.load(Ordering::Relaxed),
+            capture::wasapi::DIAG_CAPTURE_SKIPPED_FRAMES.load(Ordering::Relaxed),
         );
         #[cfg(not(windows))]
-        let (wasapi, overflow) = (0, 0);
+        let (wasapi, overflow, skipped) = (0, 0, 0);
         Self {
             sent: snap.packets_sent,
             trimmed: snap.packets_dropped,
@@ -60,6 +68,9 @@ impl Counts {
             glitches: metrics.glitch_counts(),
             wasapi,
             overflow,
+            skipped,
+            clipped: pipeline::convert::DIAG_CLIPPED_SAMPLES.load(Ordering::Relaxed),
+            timer: pipeline::timer::DIAG_TIMER_TIMEOUTS.load(Ordering::Relaxed),
         }
     }
 }
@@ -97,6 +108,7 @@ impl AudioWatch {
         // Peaks cover this second only, whether or not it gets a line.
         let late_ms = stats.send_late_max_us.swap(0, Ordering::Relaxed) as f64 / 1000.0;
         let (feed_gap, ring_peak) = metrics.take_burst_peaks();
+        let peak = f32::from_bits(pipeline::convert::DIAG_PEAK_F32_BITS.swap(0, Ordering::Relaxed));
         #[cfg(windows)]
         let (win_burst, win_gap_us) = (
             capture::wasapi::DIAG_CAPTURE_BURST_MAX_FRAMES.swap(0, Ordering::Relaxed),
@@ -117,8 +129,11 @@ impl AudioWatch {
             ("gap", d(g.capture_gap, lg.capture_gap)),
             ("silent", d(g.source_silent, lg.source_silent)),
             ("wasapi", d(now.wasapi, last.wasapi)),
+            ("skipped", d(now.skipped, last.skipped)),
             ("overflow", d(now.overflow, last.overflow)),
             ("resend", d(now.resend, last.resend)),
+            ("clipped", d(now.clipped, last.clipped)),
+            ("timer", d(now.timer, last.timer)),
         ];
         let event = fields.iter().any(|&(_, n)| n > 0) || late_ms >= LATE_FLAG_MS;
         let mut line = format!("{} {}", clock(), if event { '!' } else { ' ' });
@@ -126,7 +141,7 @@ impl AudioWatch {
             line += &format!(" {name}={n}");
         }
         line += &format!(
-            " win_burst={win_burst} win_gap={:.1}ms feed_gap={:.1}ms ring_peak={ring_peak}",
+            " win_burst={win_burst} win_gap={:.1}ms feed_gap={:.1}ms ring_peak={ring_peak} peak={peak:.2}",
             win_gap_us as f64 / 1000.0,
             feed_gap.as_secs_f64() * 1000.0,
         );

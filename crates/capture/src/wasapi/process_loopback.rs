@@ -57,8 +57,10 @@ fn capture_format() -> WAVEFORMATEX {
     }
 }
 
-/// Engine buffer for the capture client, in 100 ns units (20 ms, as in the sample).
-const CAPTURE_BUFFER_HNS: i64 = 200_000;
+/// Engine buffer for the capture client, in 100 ns units (100 ms). The sample's 20 ms held
+/// only two 10 ms packets, so a capture wake-up ~20 ms late lost audio (heard as a click).
+/// Packets are still read as soon as each arrives, so this adds no latency.
+const CAPTURE_BUFFER_HNS: i64 = 1_000_000;
 
 /// Filtering mode for process-specific loopback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -244,6 +246,10 @@ impl ProcessLoopbackSource {
 
 impl AudioSource for ProcessLoopbackSource {
     fn is_live(&self) -> bool {
+        true
+    }
+
+    fn has_capture_timestamps(&self) -> bool {
         true
     }
 
@@ -505,6 +511,13 @@ fn run_process_capture_loop(
                     break;
                 }
                 wake.frames(num_frames);
+                let skipped = wake.position(device_pos, num_frames);
+                super::push_silence(
+                    &mut producer,
+                    skipped,
+                    format_info.sample_rate,
+                    format_info.channels as usize,
+                );
 
                 let mut mapped_flags = 0u32;
                 if (flags & (AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32)) != 0 {

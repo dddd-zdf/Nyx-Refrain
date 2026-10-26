@@ -156,6 +156,12 @@ pub trait AudioSource: Send {
         false
     }
 
+    /// Whether chunk timestamps mark when the audio was captured, steadily enough to clock
+    /// the stream from (the sender then follows the capture clock instead of its own timer).
+    fn has_capture_timestamps(&self) -> bool {
+        false
+    }
+
     /// Signal raised whenever new audio is queued, so readers can block instead of polling.
     /// `None` (the default) means the reader must poll.
     fn data_signal(&self) -> Option<Arc<DataSignal>> {

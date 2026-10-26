@@ -493,6 +493,10 @@ impl capture::AudioSource for SharedSource {
     fn data_signal(&self) -> Option<Arc<capture::DataSignal>> {
         self.lock().data_signal()
     }
+
+    fn has_capture_timestamps(&self) -> bool {
+        self.lock().has_capture_timestamps()
+    }
 }
 
 #[cfg(target_os = "linux")]

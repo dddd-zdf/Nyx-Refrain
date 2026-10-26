@@ -13,6 +13,10 @@
 
 use std::time::{Duration, Instant};
 
+/// Waits on the Windows send timer that ended on the 50 ms fallback timeout instead of the
+/// timer firing; read by the audio watcher.
+pub static DIAG_TIMER_TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Wait until target monotonic `Instant` with sub-millisecond precision.
 pub fn wait_until(target: Instant) {
     let now = Instant::now();
@@ -140,6 +144,7 @@ thread_local! {
 
 #[cfg(windows)]
 fn wait_until_windows(target: Instant) -> bool {
+    use windows::Win32::Foundation::WAIT_TIMEOUT;
     use windows::Win32::System::Threading::{SetWaitableTimer, WaitForSingleObject};
 
     THREAD_TIMER.with(|timer| {
@@ -160,7 +165,9 @@ fn wait_until_windows(target: Instant) -> bool {
             let res = SetWaitableTimer(timer.0, &due_time, 0, None, None, false);
             if res.is_ok() {
                 let timeout_ms = (dur.as_millis() as u32).saturating_add(50);
-                let _ = WaitForSingleObject(timer.0, timeout_ms);
+                if WaitForSingleObject(timer.0, timeout_ms) == WAIT_TIMEOUT {
+                    DIAG_TIMER_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         true

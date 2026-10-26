@@ -35,12 +35,20 @@ pub static DIAG_CAPTURE_BURST_MAX_FRAMES: std::sync::atomic::AtomicU64 =
 pub static DIAG_CAPTURE_WAKE_GAP_MAX_US: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Frames Windows skipped: a packet's device position started past the end of the previous
+/// one, so that audio never reached us (it was lost before capture, or the capture buffer
+/// overflowed while this thread was late).
+pub static DIAG_CAPTURE_SKIPPED_FRAMES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Feeds [`DIAG_CAPTURE_BURST_MAX_FRAMES`] and [`DIAG_CAPTURE_WAKE_GAP_MAX_US`] from a capture
 /// thread.
 #[derive(Default)]
 pub(crate) struct WakeDiag {
     last: Option<std::time::Instant>,
     frames: u64,
+    /// Device position just past the previous packet.
+    next_pos: Option<u64>,
 }
 
 impl WakeDiag {
@@ -56,6 +64,21 @@ impl WakeDiag {
 
     pub(crate) fn frames(&mut self, n: u32) {
         self.frames += n as u64;
+    }
+
+    /// Checks that a packet starting at device position `pos` follows on from the previous
+    /// one and returns the frames skipped in between; a position that went backwards (a new
+    /// stream) just restarts the check.
+    pub(crate) fn position(&mut self, pos: u64, frames: u32) -> u64 {
+        let skipped = match self.next_pos {
+            Some(next) if pos > next => pos - next,
+            _ => 0,
+        };
+        if skipped > 0 {
+            DIAG_CAPTURE_SKIPPED_FRAMES.fetch_add(skipped, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.next_pos = Some(pos + frames as u64);
+        skipped
     }
 
     pub(crate) fn done(&self) {
@@ -79,6 +102,29 @@ pub(crate) fn push_frames(
         chunk.fill_from_iter(samples[..n].iter().copied());
     }
     samples.len() - n
+}
+
+/// Queues `frames` frames of silence in place of audio Windows skipped, so later audio keeps
+/// its place in time (the stream is clocked from frame counts); returns samples dropped.
+/// Skips over a second long are a new stream, not a gap, and are ignored.
+pub(crate) fn push_silence(
+    producer: &mut rtrb::Producer<f32>,
+    frames: u64,
+    sample_rate: u32,
+    channels: usize,
+) -> usize {
+    if frames == 0 || frames > sample_rate as u64 {
+        return 0;
+    }
+    let channels = channels.max(1);
+    let wanted = frames as usize * channels;
+    let n = wanted.min(producer.slots()) / channels * channels;
+    if n > 0
+        && let Ok(chunk) = producer.write_chunk_uninit(n)
+    {
+        chunk.fill_from_iter(std::iter::repeat(0.0));
+    }
+    wanted - n
 }
 
 /// Appends up to `max_samples` queued samples, whole frames only, to `out` in one block.
