@@ -38,7 +38,7 @@ pub struct StartParams {
     pub send_now_playing: bool,
     pub remote_control: bool,
     pub capture_mode: crate::settings::CaptureMode,
-    /// Mute this PC's speakers while streaming (Windows, per-process capture only).
+    /// Mute this PC's speakers while streaming (Windows).
     pub mute_local: bool,
 }
 
@@ -390,7 +390,7 @@ fn make_source(
                     ));
                     let src = WasapiLoopbackSource::with_config(Default::default())
                         .map_err(|e| anyhow::anyhow!("WASAPI endpoint loopback: {e}"))?;
-                    Ok((Box::new(src), false))
+                    Ok((Box::new(src), true))
                 }
             }
         }
@@ -398,7 +398,8 @@ fn make_source(
             let src = WasapiLoopbackSource::with_config(Default::default())
                 .map_err(|e| anyhow::anyhow!("WASAPI endpoint loopback: {e}"))?;
             eprintln!("nyx-refrain: capturing via WASAPI endpoint loopback");
-            Ok((Box::new(src), false))
+            // Loopback is taken before the endpoint mute, so muting keeps the stream.
+            Ok((Box::new(src), true))
         }
     }
 }

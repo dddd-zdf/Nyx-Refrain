@@ -371,10 +371,9 @@ pub fn build_menu_model(
             },
             action: Some(TrayMenuAction::ToggleCaptureMode),
         });
-        // Device loopback captures after the speakers: muting them would mute the stream.
         items.push(TrayMenuItem {
             label: t(lang, Key::MuteLocal).to_string(),
-            enabled: settings.capture_mode == CaptureMode::Process,
+            enabled: true,
             kind: MenuItemKind::Checkbox {
                 checked: settings.mute_local,
             },
@@ -918,8 +917,8 @@ mod tests {
             .iter()
             .find(|it| it.action == Some(TrayMenuAction::ToggleMuteLocal))
             .unwrap();
-        // Unavailable with device loopback capture
-        assert!(!mute_item.enabled);
+        // Available with device loopback capture too
+        assert!(mute_item.enabled);
         assert_eq!(mute_item.kind, MenuItemKind::Checkbox { checked: true });
     }
 
