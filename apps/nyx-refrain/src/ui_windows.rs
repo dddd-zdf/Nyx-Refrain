@@ -533,6 +533,16 @@ impl App {
                             .wrap(),
                         );
                     }
+                    if snap.output_missed && snap.state == State::Streaming {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(t(lang, Key::StreamOutputMissed))
+                                    .size(11.0)
+                                    .color(egui::Color32::from_rgb(0xe0, 0xa0, 0x30)),
+                            )
+                            .wrap(),
+                        );
+                    }
 
                     ui.add_space(4.0);
 

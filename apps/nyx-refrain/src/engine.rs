@@ -134,6 +134,9 @@ pub struct Shared {
     pub stats: Stats,
     pub firewall: Firewall,
     pub track_title: Option<String>,
+    /// Streaming, but the default output couldn't be switched to the chosen one (missing,
+    /// or switching failed) or it was unplugged since.
+    pub output_missed: bool,
 }
 
 #[derive(Clone)]
@@ -369,16 +372,18 @@ type OutputSwitch = ();
 
 /// Makes `want` (an endpoint ID) the default output, or switches back to the output it
 /// replaced, also when an earlier run switched and exited without switching back
-/// ([`Settings::switched_output`]).
+/// ([`Settings::switched_output`]). Returns whether switching to `want` failed (it is not
+/// connected, or Windows refused); streaming then goes on with the current output.
 ///
 /// [`Settings::switched_output`]: crate::settings::Settings::switched_output
 fn set_stream_output(
     switch: &mut Option<OutputSwitch>,
     want: Option<&str>,
     settings: &Option<Arc<Mutex<crate::settings::Settings>>>,
-) {
+) -> bool {
     #[cfg(windows)]
     {
+        let mut missed = false;
         let left = settings
             .as_ref()
             .and_then(|s| s.lock().ok().and_then(|s| s.switched_output.clone()));
@@ -395,23 +400,67 @@ fn set_stream_output(
         {
             match OutputSwitch::switch_to(id) {
                 Ok(g) => *switch = g,
-                Err(e) => tracing_like_warn(&format!("switching the default output failed: {e}")),
+                Err(e) => {
+                    tracing_like_warn(&format!("switching the default output failed: {e}"));
+                    missed = true;
+                }
             }
         }
-        let switched = switch.as_ref().map(|g| crate::settings::SwitchedOutput {
-            from: g.previous_id().to_string(),
-            to: g.target_id().to_string(),
-        });
-        if let Some(s) = settings
-            && let Ok(mut s) = s.lock()
-            && s.switched_output != switched
-        {
-            s.switched_output = switched;
-            s.save();
-        }
+        remember_switched_output(switch, settings);
+        missed
     }
     #[cfg(not(windows))]
-    let _ = (switch, want, settings);
+    {
+        let _ = (switch, want, settings);
+        false
+    }
+}
+
+/// Saves the switch we hold (see [`set_stream_output`]) for a later run to undo.
+#[cfg(windows)]
+fn remember_switched_output(
+    switch: &Option<OutputSwitch>,
+    settings: &Option<Arc<Mutex<crate::settings::Settings>>>,
+) {
+    let switched = switch.as_ref().map(|g| crate::settings::SwitchedOutput {
+        from: g.previous_id().to_string(),
+        to: g.target_id().to_string(),
+    });
+    if let Some(s) = settings
+        && let Ok(mut s) = s.lock()
+        && s.switched_output != switched
+    {
+        s.switched_output = switched;
+        s.save();
+    }
+}
+
+/// While streaming: our output stopped being the default, because the user picked another
+/// (kept, as on stop) or it was unplugged (Windows picked another). Lets go of the switch
+/// without switching back; returns whether it was unplugged.
+fn output_switch_lost(
+    switch: &mut Option<OutputSwitch>,
+    settings: &Option<Arc<Mutex<crate::settings::Settings>>>,
+) -> bool {
+    #[cfg(windows)]
+    if let Some(g) = switch.take_if(|g| !g.is_current()) {
+        let unplugged = !g.target_connected();
+        g.release();
+        remember_switched_output(switch, settings);
+        return unplugged;
+    }
+    #[cfg(not(windows))]
+    let _ = (switch, settings);
+    false
+}
+
+fn set_output_missed(shared: &Arc<Mutex<Shared>>, notifier: &dyn Notifier, missed: bool) {
+    if let Ok(mut g) = shared.lock()
+        && g.output_missed != missed
+    {
+        g.output_missed = missed;
+        notifier.wake();
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -680,11 +729,12 @@ async fn run(
                         let started = match reachable(p.device.addr).await {
                             Ok(()) => {
                                 // Before capturing, so device loopback opens the new default.
-                                set_stream_output(
+                                let missed = set_stream_output(
                                     &mut output_switch,
                                     p.stream_output.as_deref(),
                                     &settings_ref,
                                 );
+                                set_output_missed(&shared, &*notifier, missed);
                                 start(&p, &mut kept).await
                             }
                             Err(e) => Err(e),
@@ -740,6 +790,7 @@ async fn run(
                                     kept = None;
                                     set_local_mute(&mut local_mute, false, &settings_ref);
                                     set_stream_output(&mut output_switch, None, &settings_ref);
+                                    set_output_missed(&shared, &*notifier, false);
                                     set_state(&shared, &*notifier, State::Error(e));
                                 }
                             },
@@ -753,6 +804,7 @@ async fn run(
                         // First: quitting waits only briefly for the engine.
                         set_local_mute(&mut local_mute, false, &settings_ref);
                         set_stream_output(&mut output_switch, None, &settings_ref);
+                        set_output_missed(&shared, &*notifier, false);
                         if let Some(r) = running.take() {
                             r.stop().await;
                         }
@@ -826,7 +878,9 @@ async fn run(
                     Cmd::SetStreamOutput(id) => {
                         if let Some(r) = running.as_mut() {
                             r.params.stream_output = id.clone();
-                            set_stream_output(&mut output_switch, id.as_deref(), &settings_ref);
+                            let missed =
+                                set_stream_output(&mut output_switch, id.as_deref(), &settings_ref);
+                            set_output_missed(&shared, &*notifier, missed);
                         } else if id.is_none() {
                             set_stream_output(&mut output_switch, None, &settings_ref);
                         }
@@ -1070,6 +1124,9 @@ async fn run(
                 }
             }
             _ = feedback.tick(), if running.is_some() => {
+                if output_switch_lost(&mut output_switch, &settings_ref) {
+                    set_output_missed(&shared, &*notifier, true);
+                }
                 let failed = match running.as_mut() {
                     Some(r) => r.session.feedback().await.err(),
                     None => None,

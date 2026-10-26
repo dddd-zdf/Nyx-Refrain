@@ -228,11 +228,24 @@ mod policy_config {
 }
 use policy_config::set_default_render_device;
 
+/// Whether the render endpoint `id` exists and is plugged in.
+fn is_active(id: &str) -> windows::core::Result<bool> {
+    let device = open_render_device(&DeviceSpec::ById(id.to_string()))?;
+    Ok(unsafe { device.GetState()? } == DEVICE_STATE_ACTIVE)
+}
+
+/// Whether the render endpoint `id` is the default output.
+fn is_default(id: &str) -> windows::core::Result<bool> {
+    Ok(get_device_id(&get_default_render_device()?)? == id)
+}
+
 /// Keeps another render endpoint the default output until dropped, then switches back to
 /// the one it replaced. Holds only endpoint IDs, so it can be dropped on any thread.
 pub struct DefaultOutputGuard {
     target_id: String,
     previous_id: String,
+    /// Cleared by [`Self::release`].
+    restore: bool,
 }
 
 impl DefaultOutputGuard {
@@ -243,13 +256,18 @@ impl DefaultOutputGuard {
         if previous_id == target_id {
             return Ok(None);
         }
-        // Fails if the target is unplugged; the default output then stays as it was.
-        open_render_device(&DeviceSpec::ById(target_id.to_string()))?;
+        if !is_active(target_id)? {
+            return Err(windows::core::Error::new(
+                windows::core::HRESULT(0x80070490u32 as i32), // ERROR_NOT_FOUND
+                "the output is not connected",
+            ));
+        }
         set_default_render_device(target_id)?;
         info!(from = %previous_id, to = %target_id, "Switched the default output");
         Ok(Some(Self {
             target_id: target_id.to_string(),
             previous_id,
+            restore: true,
         }))
     }
 
@@ -259,7 +277,26 @@ impl DefaultOutputGuard {
         Self {
             target_id,
             previous_id,
+            restore: true,
         }
+    }
+
+    /// Whether our output is still the default: the user may have picked another, or it was
+    /// unplugged. Assumed so if Windows can't say.
+    pub fn is_current(&self) -> bool {
+        let _com = super::ComMtaGuard::new();
+        is_default(&self.target_id).unwrap_or(true)
+    }
+
+    /// Whether our output is still plugged in. Assumed so if Windows can't say.
+    pub fn target_connected(&self) -> bool {
+        let _com = super::ComMtaGuard::new();
+        is_active(&self.target_id).unwrap_or(true)
+    }
+
+    /// Drops the guard without switching back.
+    pub fn release(mut self) {
+        self.restore = false;
     }
 
     pub fn target_id(&self) -> &str {
@@ -273,10 +310,13 @@ impl DefaultOutputGuard {
 
 impl Drop for DefaultOutputGuard {
     fn drop(&mut self) {
+        if !self.restore {
+            return;
+        }
         let result = (|| -> windows::core::Result<bool> {
             let _com = super::ComMtaGuard::new()?;
             // The user picked another output meanwhile: keep their choice.
-            if get_device_id(&get_default_render_device()?)? != self.target_id {
+            if !is_default(&self.target_id)? {
                 return Ok(false);
             }
             set_default_render_device(&self.previous_id)?;
