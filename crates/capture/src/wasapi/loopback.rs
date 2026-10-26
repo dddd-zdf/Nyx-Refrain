@@ -6,7 +6,7 @@
 //! silence keep-alive and device change notifications with zero stream interruption.
 
 use std::error::Error;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -71,11 +71,30 @@ pub static DIAG_CAPTURED_FRAMES: std::sync::atomic::AtomicU64 =
 pub static DIAG_SESSIONS_OPENED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Rate and channel count of the audio in the ring buffer. Changes when the default output
+/// switches to a device with another mix format (e.g. a Bluetooth headset); written by the
+/// capture thread only while holding the rebuild lock, once the old device's audio is drained.
+struct StreamFormat {
+    sample_rate: AtomicU32,
+    channels: AtomicU16,
+}
+
+impl StreamFormat {
+    fn get(&self) -> (u32, u16) {
+        (
+            self.sample_rate.load(Ordering::Relaxed),
+            self.channels.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// WASAPI audio loopback capture source implementing `AudioSource`.
 pub struct WasapiLoopbackSource {
     config: WasapiLoopbackConfig,
     device_info: DeviceInfo,
+    /// Format of the device the source was opened on; see [`StreamFormat`] for the current one.
     format_info: WaveFormatInfo,
+    stream_format: Arc<StreamFormat>,
     consumer: rtrb::Consumer<f32>,
     discontinuity_tracker: Arc<DiscontinuityTracker>,
     rebuild_sm: Arc<Mutex<RebuildStateMachine>>,
@@ -136,6 +155,10 @@ impl WasapiLoopbackSource {
         )));
         let stop_signal = Arc::new(AtomicBool::new(false));
         let data_signal = Arc::new(crate::DataSignal::default());
+        let stream_format = Arc::new(StreamFormat {
+            sample_rate: AtomicU32::new(format_info.sample_rate),
+            channels: AtomicU16::new(format_info.channels),
+        });
 
         // Spawn capture thread
         let thread_stop = stop_signal.clone();
@@ -145,6 +168,7 @@ impl WasapiLoopbackSource {
         let thread_rebuild = rebuild_sm.clone();
         let thread_drift = drift_mapper.clone();
         let thread_data = data_signal.clone();
+        let thread_format = stream_format.clone();
 
         let thread_handle = std::thread::Builder::new()
             .name("wasapi-loopback-capture".into())
@@ -157,6 +181,7 @@ impl WasapiLoopbackSource {
                     thread_rebuild,
                     thread_drift,
                     thread_data,
+                    thread_format,
                     thread_stop,
                 );
             })?;
@@ -165,6 +190,7 @@ impl WasapiLoopbackSource {
             config,
             device_info,
             format_info,
+            stream_format,
             consumer,
             discontinuity_tracker,
             rebuild_sm,
@@ -237,11 +263,11 @@ impl AudioSource for WasapiLoopbackSource {
     }
 
     fn sample_rate(&self) -> u32 {
-        self.format_info.sample_rate
+        self.stream_format.get().0
     }
 
     fn channels(&self) -> u16 {
-        self.format_info.channels
+        self.stream_format.get().1
     }
 
     fn start(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -263,20 +289,23 @@ impl AudioSource for WasapiLoopbackSource {
         &mut self,
         max_frames: usize,
     ) -> Result<Option<AudioChunk>, Box<dyn Error + Send + Sync>> {
-        let channels = self.format_info.channels as usize;
-        let sample_rate = self.format_info.sample_rate;
         let chunk_timestamp = self.last_read_instant;
 
+        // Held while reading the format and popping, so the capture thread can't switch the
+        // format in between (it does so only under this lock).
+        let mut sm = self.rebuild_sm.lock().unwrap_or_else(|e| e.into_inner());
+        let (sample_rate, channel_count) = self.stream_format.get();
+        let channels = channel_count as usize;
+
         // If currently rebuilding from a device change, emit digital silence to keep stream continuous
-        if let Ok(mut sm) = self.rebuild_sm.lock()
-            && sm.is_rebuilding()
-        {
-            let silence_chunk = sm.generate_silence_chunk(
-                max_frames,
-                sample_rate,
-                self.format_info.channels,
-                chunk_timestamp,
-            );
+        if sm.is_rebuilding() {
+            // Audio still queued from the old device: drop it, the new device may use another
+            // format (the capture thread waits for this before switching).
+            if let Ok(old) = self.consumer.read_chunk(self.consumer.slots()) {
+                old.commit_all();
+            }
+            let silence_chunk =
+                sm.generate_silence_chunk(max_frames, sample_rate, channel_count, chunk_timestamp);
             let duration = silence_chunk.duration();
             self.last_read_instant += duration;
             DIAG_REBUILD_SILENCE.fetch_add(1, Ordering::Relaxed);
@@ -288,6 +317,7 @@ impl AudioSource for WasapiLoopbackSource {
 
         // Drain available whole frames from lock-free SPSC consumer
         super::pop_frames(&mut self.consumer, max_samples, channels, &mut samples);
+        drop(sm);
 
         if samples.is_empty() {
             // No captured data right now (WASAPI delivers every ~10 ms). Report "nothing yet"
@@ -315,12 +345,7 @@ impl AudioSource for WasapiLoopbackSource {
                 frames_ahead as f64 / sample_rate.max(1) as f64,
             ))
             .unwrap_or_else(Instant::now);
-        let chunk = AudioChunk::new(
-            samples,
-            sample_rate,
-            self.format_info.channels,
-            data_timestamp,
-        );
+        let chunk = AudioChunk::new(samples, sample_rate, channel_count, data_timestamp);
         let duration = chunk.duration();
         self.last_read_instant += duration;
 
@@ -380,6 +405,7 @@ fn run_capture_loop(
     rebuild_sm: Arc<Mutex<RebuildStateMachine>>,
     drift_mapper: Arc<Mutex<QpcTimestampMapper>>,
     data_signal: Arc<crate::DataSignal>,
+    stream_format: Arc<StreamFormat>,
     stop_signal: Arc<AtomicBool>,
 ) {
     let _com = match ComMtaGuard::new() {
@@ -410,14 +436,46 @@ fn run_capture_loop(
             }
         };
 
-        if let Ok(mut sm) = rebuild_sm.lock() {
+        let new_format = (
+            session.format_info.sample_rate,
+            session.format_info.channels,
+        );
+        let switched = new_format != stream_format.get();
+        if switched {
+            // The ring still holds the old device's audio in the old format: wait for
+            // read_chunk to drop it (it does while rebuilding) before switching.
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while producer.slots() < producer.buffer().capacity()
+                && Instant::now() < deadline
+                && !stop_signal.load(Ordering::Relaxed)
+            {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            info!(
+                sample_rate = new_format.0,
+                channels = new_format.1,
+                "Capture format changed with the new endpoint"
+            );
+        }
+        {
+            let mut sm = rebuild_sm.lock().unwrap_or_else(|e| e.into_inner());
+            stream_format
+                .sample_rate
+                .store(new_format.0, Ordering::Relaxed);
+            stream_format
+                .channels
+                .store(new_format.1, Ordering::Relaxed);
             sm.mark_active();
         }
         DIAG_SESSIONS_OPENED.fetch_add(1, Ordering::Relaxed);
 
         // Initialize drift anchor
         if let Ok(mut mapper) = drift_mapper.lock() {
-            mapper.update_anchor(0, Instant::now());
+            if switched {
+                *mapper = QpcTimestampMapper::new(0, Instant::now(), new_format.0);
+            } else {
+                mapper.update_anchor(0, Instant::now());
+            }
         }
 
         info!("WASAPI loopback capture streaming active");

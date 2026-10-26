@@ -174,6 +174,11 @@ impl DriftCompensator {
         self.filtered_drift_ppm
     }
 
+    /// The fill level (packets) the fallback PI controller steers towards.
+    pub fn target_fill_level(&self) -> usize {
+        self.config.target_fill_level
+    }
+
     /// Changes the fill level the fallback PI controller steers towards (e.g. 2 packets for
     /// live sources whose backlog is trimmed at 3 packets by the sender).
     pub fn set_target_fill_level(&mut self, packets: usize) {

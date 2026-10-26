@@ -124,6 +124,9 @@ impl PipelineProcessor {
         packets_out: &mut Vec<[i16; ALAC_PCM_SAMPLES]>,
     ) -> Result<(), String> {
         let now = chunk.timestamp;
+        if chunk.sample_rate != self.source_sample_rate && chunk.sample_rate > 0 {
+            self.change_sample_rate(chunk.sample_rate)?;
+        }
 
         // Check for source underrun
         if let Some(last_time) = self.last_chunk_time
@@ -174,6 +177,28 @@ impl PipelineProcessor {
         self.downmix_buf = downmix;
         res?;
 
+        Ok(())
+    }
+
+    /// Follows a source whose rate changed mid-stream (device loopback after the default
+    /// output switched, e.g. to a Bluetooth headset): resamples from the new rate and drops
+    /// the drift estimates, which belonged to the old device's clock.
+    fn change_sample_rate(&mut self, rate: u32) -> Result<(), String> {
+        tracing::info!(
+            from = self.source_sample_rate,
+            to = rate,
+            "Source sample rate changed"
+        );
+        self.resampler = ResamplePipeline::new(rate, DEFAULT_RESAMPLER_CHUNK_FRAMES)?;
+        self.source_sample_rate = rate;
+        self.drift = DriftCompensator::new(DriftConfig {
+            nominal_sample_rate: rate,
+            target_fill_level: self.drift.target_fill_level(),
+            ..Default::default()
+        });
+        if self.queue.is_some() {
+            self.queue = Some(QueueController::new());
+        }
         Ok(())
     }
 
@@ -382,6 +407,33 @@ mod tests {
         for pkt in &packets {
             assert_eq!(pkt.len(), ALAC_PCM_SAMPLES);
         }
+    }
+
+    #[test]
+    fn source_rate_change_keeps_duration() {
+        let metrics = Arc::new(PipelineMetricsTracker::new(DEFAULT_RING_BUFFER_PACKETS));
+        let mut proc = PipelineProcessor::new(48000, metrics, None).unwrap();
+        let mut packets = Vec::new();
+
+        // 100 ms at 48 kHz stereo, then the device switches: 100 ms at 16 kHz mono.
+        let mut speakers = SineSource::new(440.0, -20.0, 48000, 2);
+        for _ in 0..10 {
+            let chunk = speakers.read_chunk(480).unwrap().unwrap();
+            proc.process_chunk(&chunk, 16, &mut packets).unwrap();
+        }
+        let mut headset = SineSource::new(440.0, -20.0, 16000, 1);
+        for _ in 0..10 {
+            let chunk = headset.read_chunk(160).unwrap().unwrap();
+            proc.process_chunk(&chunk, 16, &mut packets).unwrap();
+        }
+        proc.flush(&mut packets).unwrap();
+
+        // 200 ms at 44.1 kHz is ~25 packets; reading the 16 kHz audio as 48 kHz would give ~17.
+        assert!(
+            (23..=27).contains(&packets.len()),
+            "Expected ~25 packets, got {}",
+            packets.len()
+        );
     }
 
     #[test]
