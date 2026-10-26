@@ -63,7 +63,7 @@ impl ResamplePipeline {
 
         let base_ratio = (TARGET_SAMPLE_RATE as f64) / (source_sample_rate as f64);
 
-        // Maximum relative ratio ±1% (10,000 ppm), easily covering the ±500 ppm drift window
+        // Maximum relative ratio ±1% (10,000 ppm), easily covering the ±1000 ppm drift window
         let max_relative_ratio = 1.01;
 
         let resampler = match interpolation {
