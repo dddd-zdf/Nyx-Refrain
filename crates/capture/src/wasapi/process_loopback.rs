@@ -526,6 +526,7 @@ fn run_process_capture_loop(
                 }
                 if (flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)) != 0 {
                     mapped_flags |= FLAG_SILENT;
+                    super::DIAG_SILENT_FLAG_FRAMES.fetch_add(num_frames as u64, Ordering::Relaxed);
                 }
                 if (flags & (AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32)) != 0 {
                     mapped_flags |= FLAG_TIMESTAMP_ERROR;

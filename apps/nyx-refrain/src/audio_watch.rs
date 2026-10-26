@@ -28,6 +28,7 @@ const LEGEND: &str = "\
 # timer    send-timer waits that ran out at the 50 ms fallback instead of firing
 # late     largest delay past a packet's scheduled send time (flagged from 5 ms)
 # Where a clump of audio comes from (largest per line):
+# win_silent frames Windows flagged as silent (480 = 10 ms)
 # win_burst  frames Windows handed over in one capture wake-up (480 = one 10 ms packet)
 # win_gap    time between capture wake-ups (about 10 ms is normal)
 # feed_gap   time between feeder reads that got audio (about 10 ms is normal)
@@ -85,7 +86,14 @@ impl AudioWatch {
     pub fn from_env() -> Self {
         let file = std::env::var_os("NYX_AUDIO_STATS")
             .filter(|v| !v.is_empty() && v != "0")
-            .and_then(|_| File::create(std::env::temp_dir().join("nyx-refrain-audio.log")).ok())
+            .and_then(|_| {
+                // Appended to, so a restart keeps the earlier lines.
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(std::env::temp_dir().join("nyx-refrain-audio.log"))
+                    .ok()
+            })
             .map(|mut f| {
                 let _ = writeln!(f, "{LEGEND}");
                 f
@@ -110,12 +118,13 @@ impl AudioWatch {
         let (feed_gap, ring_peak) = metrics.take_burst_peaks();
         let peak = f32::from_bits(pipeline::convert::DIAG_PEAK_F32_BITS.swap(0, Ordering::Relaxed));
         #[cfg(windows)]
-        let (win_burst, win_gap_us) = (
+        let (win_silent, win_burst, win_gap_us) = (
+            capture::wasapi::DIAG_SILENT_FLAG_FRAMES.swap(0, Ordering::Relaxed),
             capture::wasapi::DIAG_CAPTURE_BURST_MAX_FRAMES.swap(0, Ordering::Relaxed),
             capture::wasapi::DIAG_CAPTURE_WAKE_GAP_MAX_US.swap(0, Ordering::Relaxed),
         );
         #[cfg(not(windows))]
-        let (win_burst, win_gap_us) = (0, 0);
+        let (win_silent, win_burst, win_gap_us) = (0, 0, 0);
         // A new session starts its counters from zero.
         let Some(last) = self.last.replace(now).filter(|l| l.sent <= now.sent) else {
             let _ = writeln!(file, "{} session started", clock());
@@ -141,7 +150,7 @@ impl AudioWatch {
             line += &format!(" {name}={n}");
         }
         line += &format!(
-            " win_burst={win_burst} win_gap={:.1}ms feed_gap={:.1}ms ring_peak={ring_peak} peak={peak:.2}",
+            " win_silent={win_silent} win_burst={win_burst} win_gap={:.1}ms feed_gap={:.1}ms ring_peak={ring_peak} peak={peak:.2}",
             win_gap_us as f64 / 1000.0,
             feed_gap.as_secs_f64() * 1000.0,
         );
