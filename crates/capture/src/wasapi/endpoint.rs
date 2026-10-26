@@ -1,8 +1,9 @@
 //! WASAPI audio render endpoint discovery and selection.
 
 use std::fmt;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{
     DEVICE_STATE_ACTIVE, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender,
 };
@@ -154,6 +155,52 @@ pub fn open_render_device(spec: &DeviceSpec) -> windows::core::Result<IMMDevice>
                 windows::core::HRESULT(0x80070490u32 as i32), // ERROR_NOT_FOUND
                 msg.as_str(),
             ))
+        }
+    }
+}
+
+/// Keeps the default render endpoint (this PC's speakers) muted until dropped, then unmutes
+/// it. Holds only the endpoint ID, so it can be dropped on any thread.
+pub struct EndpointMuteGuard {
+    device_id: String,
+}
+
+impl EndpointMuteGuard {
+    /// Mutes the default render endpoint. If it is already muted, returns `None` (the user
+    /// muted it, leave it alone) unless `adopt` is set: then the guard takes it over and
+    /// unmutes it on drop (it was muted by an earlier guard that never got dropped).
+    pub fn mute_default(adopt: bool) -> windows::core::Result<Option<Self>> {
+        let _com = super::ComMtaGuard::new()?;
+        let device = get_default_render_device()?;
+        let device_id = get_device_id(&device)?;
+        let volume: IAudioEndpointVolume = unsafe { device.Activate(CLSCTX_ALL, None)? };
+        if unsafe { volume.GetMute()? }.as_bool() {
+            // Not `then_some`: a guard built and dropped here would unmute.
+            return Ok(if adopt {
+                Some(Self { device_id })
+            } else {
+                None
+            });
+        }
+        unsafe { volume.SetMute(true, std::ptr::null())? };
+        info!(device = %device_id, "Muted the local render endpoint");
+        Ok(Some(Self { device_id }))
+    }
+}
+
+impl Drop for EndpointMuteGuard {
+    fn drop(&mut self) {
+        let result = (|| -> windows::core::Result<()> {
+            let _com = super::ComMtaGuard::new()?;
+            let device = open_render_device(&DeviceSpec::ById(self.device_id.clone()))?;
+            let volume: IAudioEndpointVolume = unsafe { device.Activate(CLSCTX_ALL, None)? };
+            unsafe { volume.SetMute(false, std::ptr::null()) }
+        })();
+        match result {
+            Ok(()) => info!(device = %self.device_id, "Unmuted the local render endpoint"),
+            Err(e) => {
+                warn!(device = %self.device_id, "Failed to unmute the local render endpoint: {e}")
+            }
         }
     }
 }

@@ -22,6 +22,7 @@ pub enum TrayMenuAction {
     ToggleResumeOnLaunch,
     ToggleAutostart,
     ToggleCaptureMode,
+    ToggleMuteLocal,
     Quit,
 }
 
@@ -85,6 +86,7 @@ pub fn build_start_params(
         send_now_playing: settings.send_now_playing,
         remote_control: settings.remote_control,
         capture_mode: settings.capture_mode,
+        mute_local: settings.mute_local,
     })
 }
 
@@ -369,6 +371,15 @@ pub fn build_menu_model(
             },
             action: Some(TrayMenuAction::ToggleCaptureMode),
         });
+        // Device loopback captures after the speakers: muting them would mute the stream.
+        items.push(TrayMenuItem {
+            label: t(lang, Key::MuteLocal).to_string(),
+            enabled: settings.capture_mode == CaptureMode::Process,
+            kind: MenuItemKind::Checkbox {
+                checked: settings.mute_local,
+            },
+            action: Some(TrayMenuAction::ToggleMuteLocal),
+        });
     }
 
     // Version (disabled). Windows shows it in the flyout; Linux has only this menu.
@@ -506,6 +517,16 @@ pub fn apply_action<F>(
             if let Some(params) = restart_params {
                 engine.send(Cmd::Start(params));
             }
+        }
+        TrayMenuAction::ToggleMuteLocal => {
+            let new_state = if let Ok(mut s) = settings.lock() {
+                s.mute_local = !s.mute_local;
+                s.save();
+                s.mute_local
+            } else {
+                return;
+            };
+            engine.send(Cmd::SetMuteLocal(new_state));
         }
         TrayMenuAction::Quit => {
             on_quit();
@@ -862,7 +883,8 @@ mod tests {
                 .starts_with("Nyx Refrain v")
         );
 
-        // On Windows (include_capture_mode = true): has capture mode item, total 14 items
+        // On Windows (include_capture_mode = true): has capture mode and mute items, total 15
+        // items
         let win_items =
             build_menu_model(&snap, &settings, false, Lang::ZhCn, MenuPlatform::Windows);
         let cap_item = win_items
@@ -873,7 +895,14 @@ mod tests {
             cap_item.unwrap().kind,
             MenuItemKind::Checkbox { checked: true }
         );
-        assert_eq!(win_items.len(), 14);
+        assert_eq!(win_items.len(), 15);
+        let mute_item = win_items
+            .iter()
+            .find(|it| it.action == Some(TrayMenuAction::ToggleMuteLocal))
+            .unwrap();
+        // Unavailable with device loopback capture
+        assert!(!mute_item.enabled);
+        assert_eq!(mute_item.kind, MenuItemKind::Checkbox { checked: true });
     }
 
     #[test]
@@ -935,6 +964,9 @@ mod tests {
             || {},
         );
         assert_eq!(settings.lock().unwrap().capture_mode, CaptureMode::Endpoint);
+
+        apply_action(&TrayMenuAction::ToggleMuteLocal, &engine, &settings, || {});
+        assert!(!settings.lock().unwrap().mute_local);
 
         // Quit action
         let quit_called = Arc::new(std::sync::atomic::AtomicBool::new(false));

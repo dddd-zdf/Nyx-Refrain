@@ -64,11 +64,13 @@ pub enum Key {
     ResumeOnLaunch,
     CaptureModeEndpoint,
     CaptureModeEndpointHint,
+    MuteLocal,
+    MuteLocalHint,
 }
 
 impl Key {
     #[allow(dead_code)]
-    pub const ALL: [Key; 53] = [
+    pub const ALL: [Key; 55] = [
         Key::AppName,
         Key::StateIdle,
         Key::StateConnecting,
@@ -122,6 +124,8 @@ impl Key {
         Key::ResumeOnLaunch,
         Key::CaptureModeEndpoint,
         Key::CaptureModeEndpointHint,
+        Key::MuteLocal,
+        Key::MuteLocalHint,
     ];
 }
 
@@ -273,6 +277,14 @@ pub fn t(lang: Lang, key: Key) -> &'static str {
         }
         (Lang::En, Key::CaptureModeEndpointHint) => {
             "Default is per-process capture; device loopback includes speaker effects and volume. Switching while streaming reconnects"
+        }
+        (Lang::ZhCn, Key::MuteLocal) => "推流时静音本机",
+        (Lang::En, Key::MuteLocal) => "Mute this PC while streaming",
+        (Lang::ZhCn, Key::MuteLocalHint) => {
+            "避免本机和音箱一前一后同时出声，停止推流后恢复。设备回环采集时不可用"
+        }
+        (Lang::En, Key::MuteLocalHint) => {
+            "So this PC and the speaker don't play out of sync; unmuted when streaming stops. Not available with device loopback capture"
         }
     }
 }
