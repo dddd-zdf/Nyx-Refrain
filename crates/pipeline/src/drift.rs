@@ -5,12 +5,14 @@
 //!   QPC/monotonic timestamp) pairs supplied by `AudioChunk`, low-pass filtered.
 //! - Fallback estimator: Proportional-Integral (PI) controller operating on ring-buffer
 //!   fill level to prevent buffer underrun/overrun.
-//! - Hard clamping: drift correction strictly clamped to `[-500.0, 500.0]` ppm.
+//! - Hard clamping: drift correction strictly clamped to `[-1000.0, 1000.0]` ppm (under 2 cents
+//!   of pitch). Real outputs run further off than 500 ppm: an LG monitor over HDMI measured
+//!   about -670 ppm at 48 kHz and +800 ppm at 44.1 kHz.
 
 use std::time::{Duration, Instant};
 
-/// Maximum allowable drift correction in parts per million (±500 ppm).
-pub const MAX_DRIFT_CORRECTION_PPM: f64 = 500.0;
+/// Maximum allowable drift correction in parts per million (±1000 ppm).
+pub const MAX_DRIFT_CORRECTION_PPM: f64 = 1000.0;
 
 /// A chunk starting further than this from where the previous one ended is a gap in the
 /// timeline (audio lost, or none delivered), not drift. Derived arrival timestamps jitter by
@@ -201,7 +203,7 @@ impl DriftCompensator {
         p_term + i_term
     }
 
-    /// Compute the combined drift correction in ppm, clamped to `[-500.0, 500.0]`.
+    /// Compute the combined drift correction in ppm, clamped to `[-1000.0, 1000.0]`.
     ///
     /// If primary estimation is active and has settled, it takes precedence;
     /// otherwise, the fallback PI controller provides the correction.
@@ -229,7 +231,7 @@ impl DriftCompensator {
             pi_ppm
         };
 
-        // Strictly clamp to [-500.0, 500.0] ppm
+        // Strictly clamp to [-1000.0, 1000.0] ppm
         let clamped = combined_ppm.clamp(-MAX_DRIFT_CORRECTION_PPM, MAX_DRIFT_CORRECTION_PPM);
         self.applied_correction_ppm = clamped;
         clamped
@@ -407,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hard_clamp_pm500_ppm() {
+    fn test_hard_clamp_pm1000_ppm() {
         let mut comp = DriftCompensator::new(DriftConfig::default());
         let now = Instant::now();
 
@@ -415,7 +417,7 @@ mod tests {
         let corr = comp.compute_correction(480, now, 1000, Duration::from_millis(50));
         assert!(
             corr <= MAX_DRIFT_CORRECTION_PPM,
-            "Exceeded +500 ppm: {}",
+            "Exceeded +1000 ppm: {}",
             corr
         );
 
@@ -423,7 +425,7 @@ mod tests {
         let corr_neg = comp.compute_correction(480, now, 0, Duration::from_millis(50));
         assert!(
             corr_neg >= -MAX_DRIFT_CORRECTION_PPM,
-            "Exceeded -500 ppm: {}",
+            "Exceeded -1000 ppm: {}",
             corr_neg
         );
     }
@@ -532,6 +534,13 @@ mod tests {
         simulate_queue_loop(-300.0);
     }
 
+    /// Offsets measured on real outputs, beyond the old 500 ppm limit.
+    #[test]
+    fn queue_controller_follows_measured_device_offsets() {
+        simulate_queue_loop(-670.0);
+        simulate_queue_loop(800.0);
+    }
+
     /// Feeds 10 ms chunks of a 48 kHz source running `drift_ppm` off for `secs`, skipping the
     /// chunks whose start falls in one of `lost` (start, end) windows, with timestamps off by
     /// up to ±`jitter_ms`.
@@ -584,6 +593,22 @@ mod tests {
             (est + 670.0).abs() < 3.0,
             "estimate {est:.1} ppm, expected ~-670"
         );
+    }
+
+    #[test]
+    fn measured_device_offsets_fit_under_the_limit() {
+        // An LG monitor over HDMI: -670 ppm at 48 kHz, +800 ppm at 44.1 kHz.
+        for drift in [-670.0, 800.0] {
+            let est = primary_estimate(drift, 100.0, &[]);
+            assert!(
+                (est - drift).abs() < 3.0,
+                "estimate {est:.1} ppm, expected ~{drift}"
+            );
+            assert!(
+                est.abs() < MAX_DRIFT_CORRECTION_PPM,
+                "{drift} ppm would be clamped"
+            );
+        }
     }
 
     #[test]
