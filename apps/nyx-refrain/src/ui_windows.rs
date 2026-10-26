@@ -926,6 +926,8 @@ fn configure_styles(ctx: &egui::Context) {
         style.spacing.button_padding = egui::vec2(8.0, 4.0);
         // Hover fades cost several full CPU-rendered frames each; change state instantly.
         style.animation_time = 0.0;
+        // Narrower than the flyout, so a tooltip fits inside it instead of being cut off.
+        style.spacing.tooltip_width = FLYOUT_WIDTH - 60.0;
     });
 }
 
