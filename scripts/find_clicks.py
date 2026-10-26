@@ -14,6 +14,8 @@ for txt in glob.glob(os.path.join(tmp, "nyx-refrain-sent*.txt")):
     if os.path.exists(w):
         recs.append((float(open(txt).read()), w))
 recs.sort()
+if not recs:
+    sys.exit(f"no recordings in {tmp}: run the app with NYX_RECORD_SENT=1 first")
 
 
 def pick(when=None):
