@@ -148,6 +148,8 @@ struct App {
     /// DWM rounds the window (Windows 11). Without it (Windows 10) a rounded panel would
     /// leave the clear color showing in the square window's corners.
     rounded_corners: bool,
+    /// The custom latency was edited while streaming; restart once the edit is finished.
+    latency_restart_pending: bool,
 }
 
 impl App {
@@ -202,6 +204,7 @@ impl App {
             params,
             flyout,
             rounded_corners: false,
+            latency_restart_pending: false,
         }
     }
 
@@ -526,8 +529,11 @@ impl App {
                     });
                 });
 
+                // The latency is fixed when the stream starts, so a running stream is
+                // restarted to apply a change.
+                let mut restart = false;
                 ui.horizontal(|ui| {
-                    ui.add_enabled_ui(!active, |ui| {
+                    ui.add_enabled_ui(snap.state != State::Connecting, |ui| {
                         for p in Profile::ALL {
                             let label = match p {
                                 Profile::Low => t(lang, Key::ProfileLow),
@@ -540,6 +546,7 @@ impl App {
                                 .changed()
                             {
                                 settings_changed = true;
+                                restart = true;
                             }
                         }
                         if settings.profile == Profile::Custom {
@@ -549,9 +556,21 @@ impl App {
                                     .suffix(" ms"),
                             );
                             settings_changed |= r.changed();
+                            // Wait for the drag or typing to finish: one restart per edit.
+                            self.latency_restart_pending |= r.changed();
+                            if self.latency_restart_pending && !r.dragged() && !r.has_focus() {
+                                self.latency_restart_pending = false;
+                                restart = true;
+                            }
                         }
                     });
                 });
+                if restart
+                    && snap.state == State::Streaming
+                    && let Some(p) = self.start_params(&snap.devices, &settings)
+                {
+                    self.engine.send(Cmd::Start(p));
+                }
 
                 ui.add_space(6.0);
 
