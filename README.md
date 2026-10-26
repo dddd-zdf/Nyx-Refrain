@@ -104,6 +104,7 @@ nyxr list-interfaces
 ```
 
 - `--volume`: 0 is mute, 1–100 is a percentage (mapped to −30..0 dB), or give a negative dB value directly, e.g. `-15`.
+- `--keep-volume`: send no initial volume, so the speaker keeps the volume it is at (also ignores `volume` in the config file).
 - `--source`: `wasapi` (device loopback) by default on Windows, `process` for per-process capture; `pipewire` by default on Linux. `sine`, `wav` and `stdin` are also available.
 - See `nyxr --help` and `nyxr <subcommand> --help` for all options.
 

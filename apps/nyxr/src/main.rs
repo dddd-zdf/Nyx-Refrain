@@ -39,6 +39,11 @@ enum Commands {
         #[arg(long, allow_hyphen_values = true)]
         volume: Option<f32>,
 
+        /// Leave the receiver's volume as it is: send no initial volume (ignores `volume` in the
+        /// config file; quiet mode still mutes)
+        #[arg(long, conflicts_with = "volume")]
+        keep_volume: bool,
+
         /// Audio capture source (pipewire, wasapi, process, sine, wav, stdin). `process` (Windows):
         /// per-application loopback of everything except nyxr, taken before the output device's
         /// effects and volume; with `--device <PID>` only that process tree
@@ -583,6 +588,7 @@ async fn main() -> anyhow::Result<()> {
             target,
             interface,
             volume,
+            keep_volume,
             source,
             input_rate,
             input_format,
@@ -617,7 +623,8 @@ async fn main() -> anyhow::Result<()> {
             let source_name = source.unwrap_or(cfg.capture);
 
             let effective_quiet = quiet || (!audible && source_name == "silence");
-            let volume_db = raop::volume::cli_volume_to_db(target_vol, effective_quiet);
+            let volume_db =
+                (!keep_volume).then(|| raop::volume::cli_volume_to_db(target_vol, effective_quiet));
 
             let stdin_opts = StdinOpts {
                 rate: input_rate,
@@ -631,13 +638,12 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             #[cfg(target_os = "linux")]
-            let initial_sink_volume = if source_name == "pipewire" {
-                Some(capture::pipewire::SinkVolume {
-                    pct: raop::volume::db_to_pct(volume_db),
-                    mute: effective_quiet || volume_db <= -144.0,
-                })
-            } else {
-                None
+            let initial_sink_volume = match volume_db {
+                Some(db) if source_name == "pipewire" => Some(capture::pipewire::SinkVolume {
+                    pct: raop::volume::db_to_pct(db),
+                    mute: effective_quiet || db <= -144.0,
+                }),
+                _ => None,
             };
             #[allow(unused_variables)]
             let (audio_source, vol_ctrl) = create_audio_source(
@@ -851,7 +857,7 @@ async fn main() -> anyhow::Result<()> {
             let run = ap2run::Ap2Run {
                 target: target_addr,
                 interface,
-                volume_db,
+                volume_db: Some(volume_db),
                 quiet: effective_quiet,
                 sync_latency_ms: ap2run::sync_latency_ms(latency_profile, ap2_sync_latency_ms)?,
                 duration,
