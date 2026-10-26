@@ -106,6 +106,7 @@ nyxr list-interfaces
 - `--volume`: 0 is mute, 1–100 is a percentage (mapped to −30..0 dB), or give a negative dB value directly, e.g. `-15`.
 - `--keep-volume`: send no initial volume, so the speaker keeps the volume it is at (also ignores `volume` in the config file).
 - `--source`: `wasapi` (device loopback) by default on Windows, `process` for per-process capture; `pipewire` by default on Linux. `sine`, `wav` and `stdin` are also available.
+- `--source stdin` reads 16-bit 44.1 kHz audio bit-perfect: it is passed to the speaker unchanged. If the audio on stdin is written live on another device's clock rather than as fast as nyxr reads it (e.g. a Bluetooth receiver), add `--input-live`: nyxr then keeps `--input-buffer-ms` (default 150) buffered and follows that clock by resampling.
 - See `nyxr --help` and `nyxr <subcommand> --help` for all options.
 
 Common options can go in a config file, after which `nyxr stream --audible` is enough:

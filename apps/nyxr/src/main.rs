@@ -62,6 +62,15 @@ enum Commands {
         #[arg(long, default_value_t = 2)]
         input_channels: u16,
 
+        /// stdin is written live on another device's clock (e.g. a Bluetooth A2DP sink) rather
+        /// than as fast as nyxr reads it: buffer it and follow that clock by resampling
+        #[arg(long)]
+        input_live: bool,
+
+        /// Audio kept buffered with --input-live, in ms (absorbs bursty delivery)
+        #[arg(long, default_value_t = 150, value_parser = clap::value_parser!(u32).range(20..=2000))]
+        input_buffer_ms: u32,
+
         /// Audio device name or ID (or WAV file path when --source wav; on Linux overrides virtual sink description)
         #[arg(long)]
         device: Option<String>,
@@ -323,6 +332,8 @@ struct StdinOpts {
     rate: u32,
     format: StdinFmtArg,
     channels: u16,
+    /// Jitter buffer for a live producer (`--input-live`).
+    live_buffer: Option<Duration>,
 }
 
 #[cfg(target_os = "linux")]
@@ -355,14 +366,25 @@ fn create_audio_source(
             (),
         )),
         "stdin" => Ok((
-            Box::new(capture::sources::stdin::StdinSource::from_stdin(
-                match stdin.format {
+            {
+                let format = match stdin.format {
                     StdinFmtArg::S16le => capture::sources::stdin::StdinFormat::S16Le,
                     StdinFmtArg::F32le => capture::sources::stdin::StdinFormat::F32Le,
-                },
-                stdin.rate,
-                stdin.channels,
-            )),
+                };
+                match stdin.live_buffer {
+                    Some(buffer) => Box::new(capture::LiveStdinSource::from_stdin(
+                        format,
+                        stdin.rate,
+                        stdin.channels,
+                        buffer,
+                    )?),
+                    None => Box::new(capture::sources::stdin::StdinSource::from_stdin(
+                        format,
+                        stdin.rate,
+                        stdin.channels,
+                    )) as Box<dyn capture::AudioSource>,
+                }
+            },
             #[cfg(target_os = "linux")]
             None,
             #[cfg(not(target_os = "linux"))]
@@ -593,6 +615,8 @@ async fn main() -> anyhow::Result<()> {
             input_rate,
             input_format,
             input_channels,
+            input_live,
+            input_buffer_ms,
             device,
             no_set_default,
             stats,
@@ -630,12 +654,18 @@ async fn main() -> anyhow::Result<()> {
                 rate: input_rate,
                 format: input_format,
                 channels: input_channels,
+                live_buffer: input_live.then(|| Duration::from_millis(input_buffer_ms.into())),
             };
             if source_name == "stdin" {
                 info!(
                     "stdin PCM: {:?}, {} Hz, {} ch (set --input-rate/--input-format/--input-channels to match the producer)",
                     input_format, input_rate, input_channels
                 );
+                if input_live {
+                    info!(
+                        "stdin is live: keeping {input_buffer_ms} ms buffered and following the producer's clock"
+                    );
+                }
             }
             #[cfg(target_os = "linux")]
             let initial_sink_volume = match volume_db {
