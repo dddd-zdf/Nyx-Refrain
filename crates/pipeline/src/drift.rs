@@ -10,12 +10,14 @@
 //! was too weak to override it, so the queue overflowed every ~30 s for many minutes.
 //! Steering on the fill alone cannot get stuck that way.
 //!
-//! Corrections are clamped to `[-500.0, 500.0]` ppm (under 1 cent of pitch).
+//! Corrections are clamped to `[-1000.0, 1000.0]` ppm (under 2 cents of pitch). 500 ppm was
+//! too tight: an LG monitor's HDMI audio clock runs ~670 ppm slow, so the queue drained past
+//! the limit and ran dry every ~140 s.
 
 use std::time::Duration;
 
-/// Maximum allowable drift correction in parts per million (±500 ppm).
-pub const MAX_DRIFT_CORRECTION_PPM: f64 = 500.0;
+/// Maximum allowable drift correction in parts per million (±1000 ppm).
+pub const MAX_DRIFT_CORRECTION_PPM: f64 = 1000.0;
 
 /// Packets of fill change per second per ppm of correction: 44.1 kHz output in 352-frame
 /// packets, so 1 ppm moves `44100e-6 / 352` packets a second.
@@ -294,7 +296,7 @@ mod tests {
 
     #[test]
     fn holds_the_target_and_learns_a_steady_clock_difference() {
-        for drift in [-300.0, -50.0, 0.0, 80.0, 300.0] {
+        for drift in [-700.0, -300.0, -50.0, 0.0, 80.0, 300.0, 800.0] {
             let mut q = Queue::new(3);
             let fill = q.play(drift, 600);
             let last = *fill.last().unwrap();
