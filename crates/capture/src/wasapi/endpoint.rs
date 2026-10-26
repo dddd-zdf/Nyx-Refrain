@@ -160,31 +160,56 @@ pub fn open_render_device(spec: &DeviceSpec) -> windows::core::Result<IMMDevice>
 }
 
 /// Keeps the default render endpoint (this PC's speakers) muted until dropped, then unmutes
-/// it. Holds only the endpoint ID, so it can be dropped on any thread.
+/// it, first restoring the volume if the guard raised it. Holds only the endpoint ID, so it
+/// can be dropped on any thread.
 pub struct EndpointMuteGuard {
     device_id: String,
+    /// Volume (0.0–1.0) to restore on drop, when the guard raised it to full.
+    restore_volume: Option<f32>,
 }
 
 impl EndpointMuteGuard {
-    /// Mutes the default render endpoint. If it is already muted, returns `None` (the user
-    /// muted it, leave it alone) unless `adopt` is set: then the guard takes it over and
-    /// unmutes it on drop (it was muted by an earlier guard that never got dropped).
-    pub fn mute_default(adopt: bool) -> windows::core::Result<Option<Self>> {
+    /// Mutes the default render endpoint and, with `full_volume`, raises its volume to 100%
+    /// (endpoint loopback is taken after the volume but before the mute, so the stream gets
+    /// full level while the speakers stay silent). If it is already muted, returns `None` (the
+    /// user muted it, leave it alone) unless `adopt` is set: then the guard takes it over and
+    /// on drop restores `left_volume` and unmutes it (an earlier guard was never dropped).
+    pub fn mute_default(
+        adopt: bool,
+        full_volume: bool,
+        left_volume: Option<f32>,
+    ) -> windows::core::Result<Option<Self>> {
         let _com = super::ComMtaGuard::new()?;
         let device = get_default_render_device()?;
         let device_id = get_device_id(&device)?;
         let volume: IAudioEndpointVolume = unsafe { device.Activate(CLSCTX_ALL, None)? };
-        if unsafe { volume.GetMute()? }.as_bool() {
-            // Not `then_some`: a guard built and dropped here would unmute.
-            return Ok(if adopt {
-                Some(Self { device_id })
-            } else {
-                None
-            });
+        let muted = unsafe { volume.GetMute()? }.as_bool();
+        if muted && !adopt {
+            return Ok(None);
         }
-        unsafe { volume.SetMute(true, std::ptr::null())? };
-        info!(device = %device_id, "Muted the local render endpoint");
-        Ok(Some(Self { device_id }))
+        if !muted {
+            unsafe { volume.SetMute(true, std::ptr::null())? };
+            info!(device = %device_id, "Muted the local render endpoint");
+        }
+        let mut guard = Self {
+            device_id,
+            restore_volume: if adopt { left_volume } else { None },
+        };
+        // Raise only after muting, so the speakers never play at full volume.
+        if full_volume && guard.restore_volume.is_none() {
+            let level = unsafe { volume.GetMasterVolumeLevelScalar()? };
+            if level < 1.0 {
+                unsafe { volume.SetMasterVolumeLevelScalar(1.0, std::ptr::null())? };
+                guard.restore_volume = Some(level);
+                info!(device = %guard.device_id, level, "Raised the local render endpoint to full volume");
+            }
+        }
+        Ok(Some(guard))
+    }
+
+    /// The volume to restore on drop, if the guard raised it.
+    pub fn restore_volume(&self) -> Option<f32> {
+        self.restore_volume
     }
 }
 
@@ -194,6 +219,10 @@ impl Drop for EndpointMuteGuard {
             let _com = super::ComMtaGuard::new()?;
             let device = open_render_device(&DeviceSpec::ById(self.device_id.clone()))?;
             let volume: IAudioEndpointVolume = unsafe { device.Activate(CLSCTX_ALL, None)? };
+            // Restore the volume before unmuting, so the speakers never play at full volume.
+            if let Some(level) = self.restore_volume {
+                unsafe { volume.SetMasterVolumeLevelScalar(level, std::ptr::null())? };
+            }
             unsafe { volume.SetMute(false, std::ptr::null()) }
         })();
         match result {
