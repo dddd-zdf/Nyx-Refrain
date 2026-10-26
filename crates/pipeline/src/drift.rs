@@ -12,6 +12,11 @@ use std::time::{Duration, Instant};
 /// Maximum allowable drift correction in parts per million (±500 ppm).
 pub const MAX_DRIFT_CORRECTION_PPM: f64 = 500.0;
 
+/// A chunk starting further than this from where the previous one ended is a gap in the
+/// timeline (audio lost, or none delivered), not drift. Derived arrival timestamps jitter by
+/// about one 10 ms capture period; drift moves them by microseconds per chunk.
+const TIMELINE_GAP: Duration = Duration::from_millis(50);
+
 /// Configuration parameters for drift compensation.
 #[derive(Debug, Clone)]
 pub struct DriftConfig {
@@ -44,10 +49,17 @@ impl Default for DriftConfig {
 #[derive(Debug)]
 pub struct DriftCompensator {
     config: DriftConfig,
-    /// Total frames delivered by source since tracking began.
+    /// Frames delivered by the source between `anchor` and the start of the latest chunk.
     total_source_frames: u64,
     /// First timestamp recorded.
     start_time: Option<Instant>,
+    /// Where the primary estimate's timeline starts, moved by every gap in it so that time
+    /// without audio is not counted as a slow clock.
+    anchor: Option<Instant>,
+    /// Where the latest chunk ends on its timeline.
+    next_expected: Option<Instant>,
+    /// Frames in the latest chunk, added to the total when the next one arrives.
+    pending_frames: u64,
     /// Last timestamp recorded.
     last_time: Option<Instant>,
     /// Low-pass filtered estimated drift in ppm.
@@ -65,6 +77,9 @@ impl DriftCompensator {
             config,
             total_source_frames: 0,
             start_time: None,
+            anchor: None,
+            next_expected: None,
+            pending_frames: 0,
             last_time: None,
             filtered_drift_ppm: 0.0,
             integral_error: 0.0,
@@ -76,6 +91,9 @@ impl DriftCompensator {
     pub fn reset(&mut self) {
         self.total_source_frames = 0;
         self.start_time = None;
+        self.anchor = None;
+        self.next_expected = None;
+        self.pending_frames = 0;
         self.last_time = None;
         self.filtered_drift_ppm = 0.0;
         self.integral_error = 0.0;
@@ -102,19 +120,36 @@ impl DriftCompensator {
     ///
     /// Low-pass filtered via exponential moving average:
     /// `filtered_ppm = (1 - alpha) * filtered_ppm + alpha * raw_ppm`
+    ///
+    /// A gap in the timeline (a chunk starting more than [`TIMELINE_GAP`] away from where the
+    /// previous one ended: audio dropped while the capture buffer was full, or a pause with
+    /// nothing delivered) moves the anchor by the gap instead of counting it as drift. Counted,
+    /// a 250 ms loss at startup read as -500 ppm for minutes.
     pub fn update_primary(&mut self, chunk_frames: usize, timestamp: Instant) -> f64 {
-        let start = match self.start_time {
-            Some(t) => t,
-            None => {
-                self.start_time = Some(timestamp);
-                self.last_time = Some(timestamp);
-                self.total_source_frames = 0;
-                return self.filtered_drift_ppm;
-            }
+        let chunk_duration =
+            Duration::from_secs_f64(chunk_frames as f64 / self.config.nominal_sample_rate as f64);
+        let (Some(anchor), Some(expected)) = (self.anchor, self.next_expected) else {
+            self.start_time = Some(timestamp);
+            self.anchor = Some(timestamp);
+            self.last_time = Some(timestamp);
+            self.next_expected = Some(timestamp + chunk_duration);
+            self.total_source_frames = 0;
+            self.pending_frames = chunk_frames as u64;
+            return self.filtered_drift_ppm;
         };
 
+        let start = if timestamp > expected + TIMELINE_GAP {
+            anchor + (timestamp - expected)
+        } else if timestamp + TIMELINE_GAP < expected {
+            anchor.checked_sub(expected - timestamp).unwrap_or(anchor)
+        } else {
+            anchor
+        };
+        self.anchor = Some(start);
         self.last_time = Some(timestamp);
-        self.total_source_frames += chunk_frames as u64;
+        self.next_expected = Some(timestamp + chunk_duration);
+        self.total_source_frames += self.pending_frames;
+        self.pending_frames = chunk_frames as u64;
 
         if timestamp <= start {
             return self.filtered_drift_ppm;
@@ -495,5 +530,66 @@ mod tests {
     #[test]
     fn queue_controller_follows_a_slow_producer() {
         simulate_queue_loop(-300.0);
+    }
+
+    /// Feeds 10 ms chunks of a 48 kHz source running `drift_ppm` off for `secs`, skipping the
+    /// chunks whose start falls in one of `lost` (start, end) windows, with timestamps off by
+    /// up to ±`jitter_ms`.
+    fn primary_run(
+        drift_ppm: f64,
+        secs: f64,
+        lost: &[(f64, f64)],
+        jitter_ms: f64,
+    ) -> DriftCompensator {
+        let mut comp = DriftCompensator::new(DriftConfig {
+            nominal_sample_rate: 48000,
+            ..Default::default()
+        });
+        let start = Instant::now();
+        let chunk_secs = 0.01 / (1.0 + drift_ppm * 1e-6);
+        let mut seed = 1u32;
+        for k in 0..(secs / chunk_secs) as u64 {
+            let t = k as f64 * chunk_secs;
+            if lost.iter().any(|&(a, b)| t >= a && t < b) {
+                continue;
+            }
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let jitter = (seed >> 8) as f64 / (1u32 << 24) as f64 * 2.0 - 1.0;
+            let at = t + 0.5 + jitter * jitter_ms / 1000.0; // +0.5 s: keep the jitter positive
+            comp.update_primary(480, start + Duration::from_secs_f64(at));
+        }
+        comp
+    }
+
+    fn primary_estimate(drift_ppm: f64, secs: f64, lost: &[(f64, f64)]) -> f64 {
+        primary_run(drift_ppm, secs, lost, 0.0).estimated_drift_ppm()
+    }
+
+    #[test]
+    fn audio_lost_at_startup_is_not_drift() {
+        // Measured on Windows: the capture buffer overflowed while the AirPlay session was
+        // still being set up and 250 ms were lost; the estimate then read -488 ppm after
+        // 8 minutes for a source about 9 ppm fast.
+        let est = primary_estimate(9.0, 30.0, &[(1.3, 1.55)]);
+        assert!(
+            (est - 9.0).abs() < 3.0,
+            "estimate {est:.1} ppm, expected ~9"
+        );
+    }
+
+    #[test]
+    fn a_pause_without_audio_is_not_drift() {
+        let est = primary_estimate(-670.0, 100.0, &[(20.0, 80.0)]);
+        assert!(
+            (est + 670.0).abs() < 3.0,
+            "estimate {est:.1} ppm, expected ~-670"
+        );
+    }
+
+    #[test]
+    fn timestamp_jitter_is_not_a_gap() {
+        // Arrival timestamps derived from the capture queue jitter by up to one period.
+        let comp = primary_run(-670.0, 60.0, &[], 10.0);
+        assert_eq!(comp.anchor, comp.start_time, "jitter moved the anchor");
     }
 }
