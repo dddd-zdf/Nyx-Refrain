@@ -435,6 +435,17 @@ impl App {
                                 settings_changed = true;
                                 self.engine.send(Cmd::SetMuteLocal(mute_local));
                             }
+
+                            let mut audio_log = settings.audio_log;
+                            if ui
+                                .checkbox(&mut audio_log, t(lang, Key::AudioLog))
+                                .on_hover_text(t(lang, Key::AudioLogHint))
+                                .changed()
+                            {
+                                settings.audio_log = audio_log;
+                                settings_changed = true;
+                                self.engine.send(Cmd::SetAudioLog(audio_log));
+                            }
                         });
                     });
                 });

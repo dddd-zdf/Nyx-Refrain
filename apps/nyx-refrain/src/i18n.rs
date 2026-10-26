@@ -66,11 +66,13 @@ pub enum Key {
     CaptureModeEndpointHint,
     MuteLocal,
     MuteLocalHint,
+    AudioLog,
+    AudioLogHint,
 }
 
 impl Key {
     #[allow(dead_code)]
-    pub const ALL: [Key; 55] = [
+    pub const ALL: [Key; 57] = [
         Key::AppName,
         Key::StateIdle,
         Key::StateConnecting,
@@ -126,6 +128,8 @@ impl Key {
         Key::CaptureModeEndpointHint,
         Key::MuteLocal,
         Key::MuteLocalHint,
+        Key::AudioLog,
+        Key::AudioLogHint,
     ];
 }
 
@@ -285,6 +289,14 @@ pub fn t(lang: Lang, key: Key) -> &'static str {
         }
         (Lang::En, Key::MuteLocalHint) => {
             "So this PC and the speaker don't play out of sync; unmuted when streaming stops. Not available with device loopback capture"
+        }
+        (Lang::ZhCn, Key::AudioLog) => "音频日志（调试）",
+        (Lang::En, Key::AudioLog) => "Audio log (debug)",
+        (Lang::ZhCn, Key::AudioLogHint) => {
+            "推流时每秒写一行到 %TEMP%\\nyx-refrain-audio.log，用于排查爆音"
+        }
+        (Lang::En, Key::AudioLogHint) => {
+            "While streaming, writes one line a second to %TEMP%\\nyx-refrain-audio.log, for tracing crackles"
         }
     }
 }

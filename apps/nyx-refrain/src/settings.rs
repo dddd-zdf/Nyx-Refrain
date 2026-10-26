@@ -96,6 +96,8 @@ pub struct Settings {
     /// Whether streaming was left on: set by Start, cleared only by an explicit Stop (quitting,
     /// logging out or shutting down while streaming keeps it set).
     pub was_streaming: bool,
+    /// Write the audio health log (see `audio_watch`), for tracing crackles.
+    pub audio_log: bool,
 }
 
 impl Default for Settings {
@@ -114,6 +116,7 @@ impl Default for Settings {
             local_muted: false,
             resume_on_launch: true,
             was_streaming: false,
+            audio_log: false,
         }
     }
 }
@@ -168,6 +171,7 @@ mod tests {
             local_muted: true,
             resume_on_launch: false,
             was_streaming: true,
+            audio_log: true,
         };
         let text = toml::to_string_pretty(&s).unwrap();
         assert!(text.contains("language = \"zh-CN\""));
@@ -188,6 +192,7 @@ mod tests {
         assert!(back.local_muted);
         assert!(!back.resume_on_launch);
         assert!(back.was_streaming);
+        assert!(back.audio_log);
 
         // Old gui.toml without language, send_now_playing or capture_mode must get the defaults
         let partial: Settings = toml::from_str("volume_pct = 10.0").unwrap();
@@ -201,6 +206,7 @@ mod tests {
         assert!(!partial.local_muted);
         assert!(partial.resume_on_launch);
         assert!(!partial.was_streaming);
+        assert!(!partial.audio_log);
 
         // Explicit en
         let en: Settings = toml::from_str("language = \"en\"").unwrap();

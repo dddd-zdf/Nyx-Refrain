@@ -1,5 +1,5 @@
-//! Optional audio health log, for tracing crackles to a cause. Set `NYX_AUDIO_STATS=1` to
-//! write `%TEMP%\nyx-refrain-audio.log` (`/tmp` on Linux): one line per second, marked `!`
+//! Optional audio health log, for tracing crackles to a cause. Turn on "Audio log" in the
+//! flyout settings (or set `NYX_AUDIO_STATS=1`) to write `%TEMP%\nyx-refrain-audio.log` (`/tmp` on Linux): one line per second, marked `!`
 //! when something could be heard. Every second is written so that a crackle the counters
 //! don't explain can still be matched against that second's numbers.
 
@@ -27,6 +27,7 @@ const LEGEND: &str = "\
 # clipped  samples louder than full scale, cut off at the limit (crackle on loud parts)
 # timer    send-timer waits that ran out at the 50 ms fallback instead of firing
 # late     largest delay past a packet's scheduled send time (flagged from 5 ms)
+# send_block longest time one network send blocked (a stall here is the Wi-Fi/network driver)
 # Where a clump of audio comes from (largest per line):
 # win_silent frames Windows flagged as silent (480 = 10 ms)
 # win_burst  frames Windows handed over in one capture wake-up (480 = one 10 ms packet)
@@ -78,15 +79,34 @@ impl Counts {
 
 pub struct AudioWatch {
     file: Option<File>,
+    /// `NYX_AUDIO_STATS` is set: log whatever the setting says.
+    forced: bool,
     last: Option<Counts>,
     window_start: Instant,
 }
 
 impl AudioWatch {
     pub fn from_env() -> Self {
-        let file = std::env::var_os("NYX_AUDIO_STATS")
-            .filter(|v| !v.is_empty() && v != "0")
-            .and_then(|_| {
+        let forced = std::env::var_os("NYX_AUDIO_STATS").is_some_and(|v| !v.is_empty() && v != "0");
+        let mut watch = Self {
+            file: None,
+            forced,
+            last: None,
+            window_start: Instant::now(),
+        };
+        watch.set_enabled(false);
+        watch
+    }
+
+    /// Follows the "Audio log" setting; takes effect at once, mid-stream too.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        let enabled = enabled || self.forced;
+        if enabled == self.file.is_some() {
+            return;
+        }
+        self.last = None;
+        self.file = enabled
+            .then(|| {
                 // Appended to, so a restart keeps the earlier lines.
                 std::fs::OpenOptions::new()
                     .create(true)
@@ -94,15 +114,11 @@ impl AudioWatch {
                     .open(std::env::temp_dir().join("nyx-refrain-audio.log"))
                     .ok()
             })
+            .flatten()
             .map(|mut f| {
                 let _ = writeln!(f, "{LEGEND}");
                 f
             });
-        Self {
-            file,
-            last: None,
-            window_start: Instant::now(),
-        }
     }
 
     /// Called on the engine's refresh tick while streaming; writes at most once a second.
@@ -115,6 +131,7 @@ impl AudioWatch {
         let now = Counts::read(metrics, stats);
         // Peaks cover this second only, whether or not it gets a line.
         let late_ms = stats.send_late_max_us.swap(0, Ordering::Relaxed) as f64 / 1000.0;
+        let block_ms = stats.send_block_max_us.swap(0, Ordering::Relaxed) as f64 / 1000.0;
         let (feed_gap, ring_peak) = metrics.take_burst_peaks();
         let peak = f32::from_bits(pipeline::convert::DIAG_PEAK_F32_BITS.swap(0, Ordering::Relaxed));
         #[cfg(windows)]
@@ -156,7 +173,7 @@ impl AudioWatch {
         );
         let snap = metrics.snapshot();
         line += &format!(
-            " late={late_ms:.1}ms fill={fill} nudge={:+.0}ppm learned={:+.1}ppm sent={}",
+            " late={late_ms:.1}ms send_block={block_ms:.1}ms fill={fill} nudge={:+.0}ppm learned={:+.1}ppm sent={}",
             snap.applied_correction_ppm,
             snap.estimated_drift_ppm,
             d(now.sent, last.sent)

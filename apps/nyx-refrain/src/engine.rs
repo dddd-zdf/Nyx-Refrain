@@ -55,6 +55,7 @@ pub enum Cmd {
     SetSendNowPlaying(bool),
     SetRemoteControl(bool),
     SetMuteLocal(bool),
+    SetAudioLog(bool),
     Discover,
     CheckFirewall,
     #[allow(dead_code)]
@@ -586,6 +587,7 @@ async fn run(
                                     && (s.device_name.is_some() || s.device_addr.is_some())
                             })
                             .unwrap_or(false);
+                        audio_watch.set_enabled(s.lock().is_ok_and(|s| s.audio_log));
                         settings_ref = Some(s);
                         if wants_resume && running.is_none() && resume.is_none() {
                             resume = Some(Resume::new(Instant::now()));
@@ -764,6 +766,7 @@ async fn run(
                             set_local_mute(&mut local_mute, false, &settings_ref);
                         }
                     }
+                    Cmd::SetAudioLog(enabled) => audio_watch.set_enabled(enabled),
                     Cmd::SetVolume(pct) => {
                         if let Some(r) = running.as_mut() {
                             let result = r.session.set_volume(pct_to_db(pct)).await;

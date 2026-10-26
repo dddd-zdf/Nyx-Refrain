@@ -142,6 +142,8 @@ pub struct Ap2Stats {
     pub retransmit_missing: AtomicU64,
     /// Largest delay (µs) past a packet's scheduled send time since last reset.
     pub send_late_max_us: AtomicU64,
+    /// Longest time (µs) one audio `send_to` call blocked since last reset.
+    pub send_block_max_us: AtomicU64,
 }
 
 /// RTSP/HTTP connection that switches to HAP encryption after pairing.
@@ -1015,7 +1017,11 @@ impl Ap2Session {
                         write_rtp_header(idx == 0, seq, ts, ssrc, &mut header);
                         let n = cipher.seal(&header, &payload, &mut packet);
                         history.insert(seq, &packet[..n]);
+                        let sent_at = Instant::now();
                         let _ = audio_sock.send_to(&packet[..n], remote_audio);
+                        stats
+                            .send_block_max_us
+                            .fetch_max(sent_at.elapsed().as_micros() as u64, Ordering::Relaxed);
                         stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                         idx += 1;
                     }
