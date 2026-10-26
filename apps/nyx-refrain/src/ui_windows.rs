@@ -312,7 +312,7 @@ impl App {
             };
             *settings_changed = true;
             if snap.state == State::Streaming
-                && let Some(p) = self.start_params(&snap.devices, &settings)
+                && let Some(p) = self.start_params(&snap.devices, settings)
             {
                 self.engine.send(Cmd::Start(p));
             }
