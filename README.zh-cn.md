@@ -104,6 +104,7 @@ nyxr list-interfaces
 ```
 
 - `--volume`：0 为静音，1–100 为百分比（映射到 −30..0 dB），也可以直接写负的分贝值，如 `-15`。
+- `--keep-volume`：不发送初始音量，音箱保持当前音量（同时忽略配置文件里的 `volume`）。
 - `--source`：Windows 默认 `wasapi`（设备回环），`process` 为按进程采集；Linux 默认 `pipewire`。另有 `sine`、`wav`、`stdin`。
 - 完整参数见 `nyxr --help` 与 `nyxr <子命令> --help`。
 
