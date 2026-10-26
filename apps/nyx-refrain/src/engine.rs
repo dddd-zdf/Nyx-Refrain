@@ -371,6 +371,14 @@ type OutputSwitch = capture::wasapi::DefaultOutputGuard;
 #[cfg(not(windows))]
 type OutputSwitch = ();
 
+#[derive(Default)]
+struct StreamOutput {
+    guard: Option<OutputSwitch>,
+    /// (ours, the output it replaced) when stopping found another output the default (a
+    /// headset turned on): if that output's app later switches to ours, we switch back.
+    handed_off: Option<(String, String)>,
+}
+
 /// Makes `want` (an endpoint ID) the default output, or switches back to the output it
 /// replaced, also when an earlier run switched and exited without switching back
 /// ([`Settings::switched_output`]). Returns whether switching to `want` failed (it is not
@@ -378,7 +386,7 @@ type OutputSwitch = ();
 ///
 /// [`Settings::switched_output`]: crate::settings::Settings::switched_output
 fn set_stream_output(
-    switch: &mut Option<OutputSwitch>,
+    switch: &mut StreamOutput,
     want: Option<&str>,
     settings: &Option<Arc<Mutex<crate::settings::Settings>>>,
 ) -> bool {
@@ -388,26 +396,32 @@ fn set_stream_output(
         let left = settings
             .as_ref()
             .and_then(|s| s.lock().ok().and_then(|s| s.switched_output.clone()));
-        if switch.is_none()
+        if switch.guard.is_none()
             && let Some(left) = left
         {
-            *switch = Some(OutputSwitch::adopt(left.to, left.from));
+            switch.guard = Some(OutputSwitch::adopt(left.to, left.from));
         }
-        if switch.as_ref().is_some_and(|g| want != Some(g.target_id())) {
-            *switch = None;
+        if want.is_some() {
+            switch.handed_off = None;
         }
-        if switch.is_none()
+        if let Some(g) = switch.guard.take_if(|g| want != Some(g.target_id())) {
+            if !g.is_current() {
+                switch.handed_off = Some((g.target_id().into(), g.previous_id().into()));
+            }
+            drop(g);
+        }
+        if switch.guard.is_none()
             && let Some(id) = want
         {
             match OutputSwitch::switch_to(id) {
-                Ok(g) => *switch = g,
+                Ok(g) => switch.guard = g,
                 Err(e) => {
                     tracing_like_warn(&format!("switching the default output failed: {e}"));
                     missed = true;
                 }
             }
         }
-        remember_switched_output(switch, settings);
+        remember_switched_output(&switch.guard, settings);
         missed
     }
     #[cfg(not(windows))]
@@ -436,23 +450,44 @@ fn remember_switched_output(
     }
 }
 
-/// While streaming: our output stopped being the default, because the user picked another
-/// (kept, as on stop) or it was unplugged (Windows picked another). Lets go of the switch
-/// without switching back; returns whether it was unplugged.
+/// While streaming: our output was unplugged (Windows picked another). Lets go of the switch
+/// without switching back; returns whether it did. Another output picked meanwhile (by the
+/// user, or a headset app on power-on) keeps the switch: that app may switch back to ours
+/// later, and stopping then still restores the output we replaced (stopping while the other
+/// output is the default keeps it).
 fn output_switch_lost(
-    switch: &mut Option<OutputSwitch>,
+    switch: &mut StreamOutput,
     settings: &Option<Arc<Mutex<crate::settings::Settings>>>,
 ) -> bool {
     #[cfg(windows)]
-    if let Some(g) = switch.take_if(|g| !g.is_current()) {
-        let unplugged = !g.target_connected();
+    if let Some(g) = switch
+        .guard
+        .take_if(|g| !g.is_current() && !g.target_connected())
+    {
         g.release();
-        remember_switched_output(switch, settings);
-        return unplugged;
+        remember_switched_output(&switch.guard, settings);
+        return true;
     }
     #[cfg(not(windows))]
     let _ = (switch, settings);
     false
+}
+
+/// Not streaming: see [`StreamOutput::handed_off`].
+fn hand_back_output(switch: &mut StreamOutput) {
+    #[cfg(windows)]
+    if let Some((ours, theirs)) = &switch.handed_off {
+        match OutputSwitch::hand_back(ours, theirs) {
+            Ok(true) => switch.handed_off = None,
+            Ok(false) => {}
+            Err(e) => {
+                tracing_like_warn(&format!("switching the default output back failed: {e}"));
+                switch.handed_off = None;
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = switch;
 }
 
 fn set_output_missed(shared: &Arc<Mutex<Shared>>, notifier: &dyn Notifier, missed: bool) {
@@ -659,7 +694,8 @@ async fn run(
     let mut last_sent_track: Option<nowplaying::NowPlaying> = None;
     let mut settings_ref: Option<Arc<Mutex<crate::settings::Settings>>> = None;
     let mut local_mute: Option<LocalMute> = None;
-    let mut output_switch: Option<OutputSwitch> = None;
+    let mut output_switch = StreamOutput::default();
+    let mut hand_back_tick = tokio::time::interval(Duration::from_secs(1));
     #[cfg(target_os = "linux")]
     let mut last_receiver_vol: Option<f32> = None;
     let mut feedback = tokio::time::interval(Duration::from_secs(2));
@@ -886,6 +922,7 @@ async fn run(
                             set_output_missed(&shared, &*notifier, missed);
                         } else if id.is_none() {
                             set_stream_output(&mut output_switch, None, &settings_ref);
+                            output_switch.handed_off = None;
                         }
                     }
                     Cmd::SetMuteLocal(enabled) => {
@@ -1126,6 +1163,12 @@ async fn run(
                     }
                     notifier.wake();
                 }
+            }
+            _ = hand_back_tick.tick(), if running.is_none()
+                && resume.is_none()
+                && output_switch.handed_off.is_some() =>
+            {
+                hand_back_output(&mut output_switch);
             }
             _ = feedback.tick(), if running.is_some() => {
                 if output_switch_lost(&mut output_switch, &settings_ref) {

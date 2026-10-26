@@ -294,6 +294,19 @@ impl DefaultOutputGuard {
         is_active(&self.target_id).unwrap_or(true)
     }
 
+    /// After a guard was dropped while another output was the default: switches from
+    /// `target_id` back to `previous_id` if something made `target_id` the default again (a
+    /// headset app returning to the output it replaced). Returns whether it switched.
+    pub fn hand_back(target_id: &str, previous_id: &str) -> windows::core::Result<bool> {
+        let _com = super::ComMtaGuard::new()?;
+        if !is_default(target_id)? || !is_active(previous_id)? {
+            return Ok(false);
+        }
+        set_default_render_device(previous_id)?;
+        info!(from = %target_id, to = %previous_id, "Switched the default output back");
+        Ok(true)
+    }
+
     /// Drops the guard without switching back.
     pub fn release(mut self) {
         self.restore = false;
