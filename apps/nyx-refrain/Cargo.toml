@@ -30,7 +30,7 @@ egui-winit = { version = "0.36", default-features = false, features = ["clipboar
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 softbuffer = { version = "0.4", default-features = false }
 tray-icon = "0.25"
-windows = { workspace = true, features = ["Win32_Storage_FileSystem", "Win32_System_Memory"] }
+windows = { workspace = true, features = ["Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_UI_Input_KeyboardAndMouse"] }
 raw-window-handle = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -1210,6 +1210,42 @@ mod tray {
     }
 }
 
+/// Brings the flyout to the foreground. winit's `focus_window` races a synthetic Alt press
+/// against `SetForegroundWindow`, so Windows often refused it; the never-focused flyout then
+/// closed itself on "focus loss". Attaching to the foreground thread's input is reliable.
+fn activate_window(window: &winit::window::Window) {
+    use raw_window_handle::HasWindowHandle;
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+    };
+    let Ok(wh) = window.window_handle() else {
+        return;
+    };
+    let raw_window_handle::RawWindowHandle::Win32(win32) = wh.as_raw() else {
+        return;
+    };
+    let hwnd = windows::Win32::Foundation::HWND(win32.hwnd.get() as *mut _);
+    // Safety: hwnd is our live window; the input attachment is undone before returning.
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground == hwnd || SetForegroundWindow(hwnd).as_bool() {
+            return;
+        }
+        let ours = GetCurrentThreadId();
+        let theirs = GetWindowThreadProcessId(foreground, None);
+        let attached =
+            theirs != 0 && theirs != ours && AttachThreadInput(ours, theirs, true).as_bool();
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetFocus(hwnd);
+        if attached {
+            let _ = AttachThreadInput(ours, theirs, false);
+        }
+    }
+}
+
 /// Keep the read-only view for the process lifetime, as required by FontData::from_static.
 /// Closing the file/mapping handles does not invalidate a mapped view.
 fn map_font(path: &str) -> windows::core::Result<&'static [u8]> {
@@ -1424,7 +1460,7 @@ impl Shell {
             state.window.set_visible(true);
         }
         if focus && state.window.is_visible() == Some(true) {
-            state.window.focus_window();
+            activate_window(&state.window);
         }
         if state.close_requested {
             self.schedule(Instant::now());
