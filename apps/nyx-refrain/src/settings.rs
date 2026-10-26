@@ -85,12 +85,16 @@ pub struct Settings {
     pub send_now_playing: bool,
     pub remote_control: bool,
     pub capture_mode: CaptureMode,
-    /// Windows: mute this PC's speakers while streaming (per-process capture only), so the
-    /// receiver's delayed copy doesn't play alongside them.
+    /// Windows: mute this PC's speakers while streaming, so the receiver's delayed copy doesn't
+    /// play alongside them. With device loopback capture the volume is also raised to 100%
+    /// while muted (that capture follows the volume), and restored when unmuting.
     pub mute_local: bool,
     /// Windows: the speakers are muted by us, not the user. Lets a later run unmute them when
     /// the app exited without doing so (logout, crash).
     pub local_muted: bool,
+    /// Windows: the speakers' volume (0.0–1.0) before we raised it to 100%, for a later run to
+    /// restore when the app exited without doing so.
+    pub local_volume: Option<f32>,
     /// Reconnect to the saved device on launch if the app last exited while streaming.
     pub resume_on_launch: bool,
     /// Whether streaming was left on: set by Start, cleared only by an explicit Stop (quitting,
@@ -112,6 +116,7 @@ impl Default for Settings {
             capture_mode: CaptureMode::Process,
             mute_local: true,
             local_muted: false,
+            local_volume: None,
             resume_on_launch: true,
             was_streaming: false,
         }
@@ -166,6 +171,7 @@ mod tests {
             capture_mode: CaptureMode::Endpoint,
             mute_local: false,
             local_muted: true,
+            local_volume: Some(0.3),
             resume_on_launch: false,
             was_streaming: true,
         };
@@ -186,6 +192,7 @@ mod tests {
         assert_eq!(back.capture_mode, CaptureMode::Endpoint);
         assert!(!back.mute_local);
         assert!(back.local_muted);
+        assert_eq!(back.local_volume, Some(0.3));
         assert!(!back.resume_on_launch);
         assert!(back.was_streaming);
 
@@ -199,6 +206,7 @@ mod tests {
         assert_eq!(partial.capture_mode, CaptureMode::Process);
         assert!(partial.mute_local);
         assert!(!partial.local_muted);
+        assert_eq!(partial.local_volume, None);
         assert!(partial.resume_on_launch);
         assert!(!partial.was_streaming);
 
