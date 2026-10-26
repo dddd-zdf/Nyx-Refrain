@@ -150,6 +150,8 @@ struct App {
     rounded_corners: bool,
     /// The custom latency was edited while streaming; restart once the edit is finished.
     latency_restart_pending: bool,
+    /// The flyout shows the settings page instead of the player.
+    settings_open: bool,
 }
 
 impl App {
@@ -205,11 +207,133 @@ impl App {
             flyout,
             rounded_corners: false,
             latency_restart_pending: false,
+            settings_open: false,
         }
     }
 
     fn start_params(&self, devices: &[DeviceEntry], settings: &Settings) -> Option<StartParams> {
         crate::tray_menu::build_start_params(devices, settings)
+    }
+
+    /// The settings page that the header's ⚙ button swaps in for the player. A page rather
+    /// than a menu: a menu can't grow past the flyout, and a second level would cover it.
+    fn settings_page(
+        &mut self,
+        ui: &mut egui::Ui,
+        snap: &crate::engine::Shared,
+        settings: &mut Settings,
+        lang: Lang,
+        settings_changed: &mut bool,
+    ) {
+        let current = match settings.language {
+            LanguageChoice::Auto => t(lang, Key::LangAuto),
+            LanguageChoice::ZhCn => "简体中文",
+            LanguageChoice::En => "English",
+        };
+        choice_row(
+            ui,
+            "language_choice",
+            format!("{}: {current}", t(lang, Key::TrayLanguage)),
+            |ui| {
+                let mut picked = None;
+                for (choice, label) in [
+                    (LanguageChoice::Auto, t(lang, Key::LangAuto)),
+                    (LanguageChoice::ZhCn, "简体中文"),
+                    (LanguageChoice::En, "English"),
+                ] {
+                    if ui
+                        .selectable_label(settings.language == choice, label)
+                        .clicked()
+                    {
+                        picked = Some(choice);
+                    }
+                }
+                picked
+                    .inspect(|&choice| {
+                        settings.language = choice;
+                        *settings_changed = true;
+                    })
+                    .is_some()
+            },
+        );
+
+        ui.separator();
+
+        let mut send_now_playing = settings.send_now_playing;
+        if ui
+            .checkbox(&mut send_now_playing, t(lang, Key::SendNowPlaying))
+            .changed()
+        {
+            settings.send_now_playing = send_now_playing;
+            *settings_changed = true;
+            self.engine.send(Cmd::SetSendNowPlaying(send_now_playing));
+        }
+
+        let mut remote_control = settings.remote_control;
+        if ui
+            .checkbox(&mut remote_control, t(lang, Key::RemoteControl))
+            .changed()
+        {
+            settings.remote_control = remote_control;
+            *settings_changed = true;
+            self.engine.send(Cmd::SetRemoteControl(remote_control));
+        }
+
+        let mut resume_on_launch = settings.resume_on_launch;
+        if ui
+            .checkbox(&mut resume_on_launch, t(lang, Key::ResumeOnLaunch))
+            .changed()
+        {
+            settings.resume_on_launch = resume_on_launch;
+            *settings_changed = true;
+        }
+
+        let mut autostart_enabled = crate::autostart::is_enabled().unwrap_or(false);
+        if ui
+            .checkbox(&mut autostart_enabled, t(lang, Key::Autostart))
+            .changed()
+            && let Err(e) = crate::autostart::set_enabled(autostart_enabled)
+        {
+            eprintln!("autostart toggle failed: {e}");
+        }
+
+        // Unchecked = process loopback (the default). The source is chosen at
+        // start, so a running stream is restarted to apply the change.
+        let mut endpoint = settings.capture_mode == CaptureMode::Endpoint;
+        if ui
+            .checkbox(&mut endpoint, t(lang, Key::CaptureModeEndpoint))
+            .on_hover_text(t(lang, Key::CaptureModeEndpointHint))
+            .changed()
+        {
+            settings.capture_mode = if endpoint {
+                CaptureMode::Endpoint
+            } else {
+                CaptureMode::Process
+            };
+            *settings_changed = true;
+            if snap.state == State::Streaming
+                && let Some(p) = self.start_params(&snap.devices, &settings)
+            {
+                self.engine.send(Cmd::Start(p));
+            }
+        }
+
+        // Device loopback captures after the speakers: muting them would
+        // mute the stream.
+        let mut mute_local = settings.mute_local;
+        if ui
+            .add_enabled(
+                settings.capture_mode == CaptureMode::Process,
+                egui::Checkbox::new(&mut mute_local, t(lang, Key::MuteLocal)),
+            )
+            .on_hover_text(t(lang, Key::MuteLocalHint))
+            .on_disabled_hover_text(t(lang, Key::MuteLocalHint))
+            .changed()
+        {
+            settings.mute_local = mute_local;
+            *settings_changed = true;
+            self.engine.send(Cmd::SetMuteLocal(mute_local));
+        }
     }
 }
 
@@ -320,396 +444,299 @@ impl App {
                     ui.label(egui::RichText::new(text).color(color).strong());
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.menu_button("⚙", |ui| {
-                            ui.label(egui::RichText::new(t(lang, Key::TrayLanguage)).strong());
-                            if ui
-                                .selectable_label(
-                                    settings.language == LanguageChoice::Auto,
-                                    t(lang, Key::LangAuto),
-                                )
-                                .clicked()
-                            {
-                                settings.language = LanguageChoice::Auto;
-                                settings_changed = true;
-                                ui.close();
-                            }
-                            if ui
-                                .selectable_label(
-                                    settings.language == LanguageChoice::ZhCn,
-                                    "简体中文",
-                                )
-                                .clicked()
-                            {
-                                settings.language = LanguageChoice::ZhCn;
-                                settings_changed = true;
-                                ui.close();
-                            }
-                            if ui
-                                .selectable_label(
-                                    settings.language == LanguageChoice::En,
-                                    "English",
-                                )
-                                .clicked()
-                            {
-                                settings.language = LanguageChoice::En;
-                                settings_changed = true;
-                                ui.close();
-                            }
+                        let (icon, hint) = if self.settings_open {
+                            ("⬅", Key::Back)
+                        } else {
+                            ("⚙", Key::Settings)
+                        };
+                        if ui.button(icon).on_hover_text(t(lang, hint)).clicked() {
+                            self.settings_open = !self.settings_open;
+                        }
+                    });
+                });
 
-                            ui.separator();
+                if self.settings_open {
+                    ui.add_space(4.0);
+                    self.settings_page(ui, &snap, &mut settings, lang, &mut settings_changed);
+                    ui.add_space(4.0);
+                } else {
+                    // The full error (often a raw OS message) wraps under the header instead of
+                    // widening the header row past the fixed-width flyout.
+                    if let State::Error(err) = &snap.state {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(engine_error_detail(lang, err))
+                                    .size(11.0)
+                                    .color(ERROR_COLOR),
+                            )
+                            .wrap(),
+                        );
+                    }
 
-                            let mut send_now_playing = settings.send_now_playing;
-                            if ui
-                                .checkbox(&mut send_now_playing, t(lang, Key::SendNowPlaying))
-                                .changed()
-                            {
-                                settings.send_now_playing = send_now_playing;
-                                settings_changed = true;
-                                self.engine.send(Cmd::SetSendNowPlaying(send_now_playing));
-                            }
+                    ui.add_space(4.0);
 
-                            let mut remote_control = settings.remote_control;
-                            if ui
-                                .checkbox(&mut remote_control, t(lang, Key::RemoteControl))
-                                .changed()
-                            {
-                                settings.remote_control = remote_control;
-                                settings_changed = true;
-                                self.engine.send(Cmd::SetRemoteControl(remote_control));
-                            }
+                    // Firewall banner if needed
+                    firewall_banner(ui, &self.engine, &snap.firewall, &snap.state, lang);
 
-                            let mut resume_on_launch = settings.resume_on_launch;
-                            if ui
-                                .checkbox(&mut resume_on_launch, t(lang, Key::ResumeOnLaunch))
-                                .changed()
-                            {
-                                settings.resume_on_launch = resume_on_launch;
-                                settings_changed = true;
-                            }
-
-                            let mut autostart_enabled =
-                                crate::autostart::is_enabled().unwrap_or(false);
-                            if ui
-                                .checkbox(&mut autostart_enabled, t(lang, Key::Autostart))
-                                .changed()
-                                && let Err(e) = crate::autostart::set_enabled(autostart_enabled)
-                            {
-                                eprintln!("autostart toggle failed: {e}");
-                            }
-
-                            // Unchecked = process loopback (the default). The source is chosen at
-                            // start, so a running stream is restarted to apply the change.
-                            let mut endpoint = settings.capture_mode == CaptureMode::Endpoint;
-                            if ui
-                                .checkbox(&mut endpoint, t(lang, Key::CaptureModeEndpoint))
-                                .on_hover_text(t(lang, Key::CaptureModeEndpointHint))
-                                .changed()
-                            {
-                                settings.capture_mode = if endpoint {
-                                    CaptureMode::Endpoint
-                                } else {
-                                    CaptureMode::Process
-                                };
-                                settings_changed = true;
-                                if snap.state == State::Streaming
-                                    && let Some(p) = self.start_params(&snap.devices, &settings)
+                    // 2. Device row: discovered combo + refresh button
+                    ui.horizontal(|ui| {
+                        let current = settings
+                            .device_name
+                            .clone()
+                            .unwrap_or_else(|| t(lang, Key::NoDeviceSelected).into());
+                        // Right to left: the refresh button sits flush with the right edge like
+                        // the header's language button; the combo takes the remaining width.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                            ui.add_enabled_ui(!active, |ui| {
+                                let refresh_label = if snap.discovering { "⏳" } else { "🔄" };
+                                if ui
+                                    .add_enabled(
+                                        !snap.discovering,
+                                        egui::Button::new(refresh_label),
+                                    )
+                                    .on_hover_text(t(lang, Key::Refresh))
+                                    .clicked()
                                 {
-                                    self.engine.send(Cmd::Start(p));
+                                    self.engine.send(Cmd::Discover);
+                                }
+                                egui::ComboBox::from_id_salt("device_combo")
+                                    .selected_text(&current)
+                                    .width(ui.available_width())
+                                    .show_ui(ui, |ui| {
+                                        for d in &snap.devices {
+                                            let label = format!("{} ({})", d.name, d.addr.ip());
+                                            let selected = settings.device_name.as_deref()
+                                                == Some(d.name.as_str());
+                                            if ui.selectable_label(selected, label).clicked() {
+                                                settings.device_name = Some(d.name.clone());
+                                                self.manual_addr = d.addr.to_string();
+                                                settings_changed = true;
+                                            }
+                                        }
+                                        if snap.devices.is_empty() {
+                                            ui.weak(t(lang, Key::NoDevicesDiscovered));
+                                        }
+                                    });
+                            });
+                        });
+                    });
+
+                    // Manual address disclosure
+                    egui::CollapsingHeader::new(t(lang, Key::ManualAddressDisclosure))
+                        .id_salt("manual_addr_disclosure")
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(t(lang, Key::DeviceAddress));
+                                let r = ui.add_enabled(
+                                    !active,
+                                    egui::TextEdit::singleline(&mut self.manual_addr)
+                                        .id_salt("manual_addr_edit")
+                                        .hint_text(t(lang, Key::AddressHint))
+                                        .desired_width(170.0),
+                                );
+                                if r.lost_focus() {
+                                    settings_changed = true;
+                                }
+                            });
+                        });
+
+                    ui.add_space(4.0);
+
+                    // 3. Latency profile as segmented control
+                    ui.horizontal(|ui| {
+                        let est_ms = 237
+                            + settings
+                                .profile
+                                .sync_latency_ms(settings.custom_sync_latency_ms);
+                        ui.label(t(lang, Key::LatencyProfile));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.weak(format!("≈{est_ms} ms"));
+                        });
+                    });
+
+                    // The latency is fixed when the stream starts, so a running stream is
+                    // restarted to apply a change.
+                    let mut restart = false;
+                    ui.horizontal(|ui| {
+                        ui.add_enabled_ui(snap.state != State::Connecting, |ui| {
+                            for p in Profile::ALL {
+                                let label = match p {
+                                    Profile::Low => t(lang, Key::ProfileLow),
+                                    Profile::Balanced => t(lang, Key::ProfileBalanced),
+                                    Profile::Stable => t(lang, Key::ProfileStable),
+                                    Profile::Custom => t(lang, Key::ProfileCustom),
+                                };
+                                if ui
+                                    .selectable_value(&mut settings.profile, p, label)
+                                    .changed()
+                                {
+                                    settings_changed = true;
+                                    restart = true;
                                 }
                             }
-
-                            // Device loopback captures after the speakers: muting them would
-                            // mute the stream.
-                            let mut mute_local = settings.mute_local;
-                            if ui
-                                .add_enabled(
-                                    settings.capture_mode == CaptureMode::Process,
-                                    egui::Checkbox::new(&mut mute_local, t(lang, Key::MuteLocal)),
-                                )
-                                .on_hover_text(t(lang, Key::MuteLocalHint))
-                                .on_disabled_hover_text(t(lang, Key::MuteLocalHint))
-                                .changed()
-                            {
-                                settings.mute_local = mute_local;
-                                settings_changed = true;
-                                self.engine.send(Cmd::SetMuteLocal(mute_local));
+                            if settings.profile == Profile::Custom {
+                                let r = ui.add(
+                                    egui::DragValue::new(&mut settings.custom_sync_latency_ms)
+                                        .range(raop::ap2::session::MIN_SYNC_LATENCY_MS..=1000)
+                                        .suffix(" ms"),
+                                );
+                                settings_changed |= r.changed();
+                                // Wait for the drag or typing to finish: one restart per edit.
+                                self.latency_restart_pending |= r.changed();
+                                if self.latency_restart_pending && !r.dragged() && !r.has_focus() {
+                                    self.latency_restart_pending = false;
+                                    restart = true;
+                                }
                             }
                         });
                     });
-                });
-
-                // The full error (often a raw OS message) wraps under the header instead of
-                // widening the header row past the fixed-width flyout.
-                if let State::Error(err) = &snap.state {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(engine_error_detail(lang, err))
-                                .size(11.0)
-                                .color(ERROR_COLOR),
-                        )
-                        .wrap(),
-                    );
-                }
-
-                ui.add_space(4.0);
-
-                // Firewall banner if needed
-                firewall_banner(ui, &self.engine, &snap.firewall, &snap.state, lang);
-
-                // 2. Device row: discovered combo + refresh button
-                ui.horizontal(|ui| {
-                    let current = settings
-                        .device_name
-                        .clone()
-                        .unwrap_or_else(|| t(lang, Key::NoDeviceSelected).into());
-                    // Right to left: the refresh button sits flush with the right edge like
-                    // the header's language button; the combo takes the remaining width.
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                        ui.add_enabled_ui(!active, |ui| {
-                            let refresh_label = if snap.discovering { "⏳" } else { "🔄" };
-                            if ui
-                                .add_enabled(!snap.discovering, egui::Button::new(refresh_label))
-                                .on_hover_text(t(lang, Key::Refresh))
-                                .clicked()
-                            {
-                                self.engine.send(Cmd::Discover);
-                            }
-                            egui::ComboBox::from_id_salt("device_combo")
-                                .selected_text(&current)
-                                .width(ui.available_width())
-                                .show_ui(ui, |ui| {
-                                    for d in &snap.devices {
-                                        let label = format!("{} ({})", d.name, d.addr.ip());
-                                        let selected = settings.device_name.as_deref()
-                                            == Some(d.name.as_str());
-                                        if ui.selectable_label(selected, label).clicked() {
-                                            settings.device_name = Some(d.name.clone());
-                                            self.manual_addr = d.addr.to_string();
-                                            settings_changed = true;
-                                        }
-                                    }
-                                    if snap.devices.is_empty() {
-                                        ui.weak(t(lang, Key::NoDevicesDiscovered));
-                                    }
-                                });
-                        });
-                    });
-                });
-
-                // Manual address disclosure
-                egui::CollapsingHeader::new(t(lang, Key::ManualAddressDisclosure))
-                    .id_salt("manual_addr_disclosure")
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(t(lang, Key::DeviceAddress));
-                            let r = ui.add_enabled(
-                                !active,
-                                egui::TextEdit::singleline(&mut self.manual_addr)
-                                    .id_salt("manual_addr_edit")
-                                    .hint_text(t(lang, Key::AddressHint))
-                                    .desired_width(170.0),
-                            );
-                            if r.lost_focus() {
-                                settings_changed = true;
-                            }
-                        });
-                    });
-
-                ui.add_space(4.0);
-
-                // 3. Latency profile as segmented control
-                ui.horizontal(|ui| {
-                    let est_ms = 237
-                        + settings
-                            .profile
-                            .sync_latency_ms(settings.custom_sync_latency_ms);
-                    ui.label(t(lang, Key::LatencyProfile));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.weak(format!("≈{est_ms} ms"));
-                    });
-                });
-
-                // The latency is fixed when the stream starts, so a running stream is
-                // restarted to apply a change.
-                let mut restart = false;
-                ui.horizontal(|ui| {
-                    ui.add_enabled_ui(snap.state != State::Connecting, |ui| {
-                        for p in Profile::ALL {
-                            let label = match p {
-                                Profile::Low => t(lang, Key::ProfileLow),
-                                Profile::Balanced => t(lang, Key::ProfileBalanced),
-                                Profile::Stable => t(lang, Key::ProfileStable),
-                                Profile::Custom => t(lang, Key::ProfileCustom),
-                            };
-                            if ui
-                                .selectable_value(&mut settings.profile, p, label)
-                                .changed()
-                            {
-                                settings_changed = true;
-                                restart = true;
-                            }
-                        }
-                        if settings.profile == Profile::Custom {
-                            let r = ui.add(
-                                egui::DragValue::new(&mut settings.custom_sync_latency_ms)
-                                    .range(raop::ap2::session::MIN_SYNC_LATENCY_MS..=1000)
-                                    .suffix(" ms"),
-                            );
-                            settings_changed |= r.changed();
-                            // Wait for the drag or typing to finish: one restart per edit.
-                            self.latency_restart_pending |= r.changed();
-                            if self.latency_restart_pending && !r.dragged() && !r.has_focus() {
-                                self.latency_restart_pending = false;
-                                restart = true;
-                            }
-                        }
-                    });
-                });
-                if restart
-                    && snap.state == State::Streaming
-                    && let Some(p) = self.start_params(&snap.devices, &settings)
-                {
-                    self.engine.send(Cmd::Start(p));
-                }
-
-                ui.add_space(6.0);
-
-                // 4. Full-width volume slider with speaker icon and %
-                ui.horizontal(|ui| {
-                    let icon = if settings.volume_pct <= 0.0 {
-                        "🔇"
-                    } else if settings.volume_pct < 50.0 {
-                        "🔉"
-                    } else {
-                        "🔊"
-                    };
-                    ui.label(icon);
-                    // Right to left: the value box sits flush with the right edge and the
-                    // rail takes whatever is left, so nothing overflows the panel.
-                    let r = ui
-                        .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let value = ui.add(
-                                egui::DragValue::new(&mut settings.volume_pct)
-                                    .range(0.0..=100.0)
-                                    .suffix("%")
-                                    .speed(1.0)
-                                    .fixed_decimals(0),
-                            );
-                            ui.spacing_mut().slider_width = ui.available_width().max(80.0);
-                            let rail = ui.add(
-                                egui::Slider::new(&mut settings.volume_pct, 0.0..=100.0)
-                                    .integer()
-                                    .show_value(false),
-                            );
-                            rail | value
-                        })
-                        .inner;
-                    if r.drag_stopped() || (r.changed() && !r.dragged()) {
-                        settings_changed = true;
-                        if snap.state == State::Streaming {
-                            self.engine.send(Cmd::SetVolume(settings.volume_pct));
-                        }
-                    } else if r.changed() {
-                        // Mid-drag: keep the value in memory so the % box (drawn before the
-                        // rail) shows it live; saving and sending still wait for release.
-                        if let Ok(mut s) = self.settings.lock() {
-                            s.volume_pct = settings.volume_pct;
-                        }
+                    if restart
+                        && snap.state == State::Streaming
+                        && let Some(p) = self.start_params(&snap.devices, &settings)
+                    {
+                        self.engine.send(Cmd::Start(p));
                     }
-                    // Mouse wheel over the rail or the % box: 2 % per notch like the Windows
-                    // volume flyout; touchpads scroll in points and adjust proportionally.
-                    if r.hovered() {
-                        let step = ui.input(|i| wheel_volume_step(&i.events));
-                        if step != 0.0 {
-                            settings.volume_pct = (settings.volume_pct + step).clamp(0.0, 100.0);
+
+                    ui.add_space(6.0);
+
+                    // 4. Full-width volume slider with speaker icon and %
+                    ui.horizontal(|ui| {
+                        let icon = if settings.volume_pct <= 0.0 {
+                            "🔇"
+                        } else if settings.volume_pct < 50.0 {
+                            "🔉"
+                        } else {
+                            "🔊"
+                        };
+                        ui.label(icon);
+                        // Right to left: the value box sits flush with the right edge and the
+                        // rail takes whatever is left, so nothing overflows the panel.
+                        let r = ui
+                            .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let value = ui.add(
+                                    egui::DragValue::new(&mut settings.volume_pct)
+                                        .range(0.0..=100.0)
+                                        .suffix("%")
+                                        .speed(1.0)
+                                        .fixed_decimals(0),
+                                );
+                                ui.spacing_mut().slider_width = ui.available_width().max(80.0);
+                                let rail = ui.add(
+                                    egui::Slider::new(&mut settings.volume_pct, 0.0..=100.0)
+                                        .integer()
+                                        .show_value(false),
+                                );
+                                rail | value
+                            })
+                            .inner;
+                        if r.drag_stopped() || (r.changed() && !r.dragged()) {
                             settings_changed = true;
                             if snap.state == State::Streaming {
                                 self.engine.send(Cmd::SetVolume(settings.volume_pct));
                             }
+                        } else if r.changed() {
+                            // Mid-drag: keep the value in memory so the % box (drawn before the
+                            // rail) shows it live; saving and sending still wait for release.
+                            if let Ok(mut s) = self.settings.lock() {
+                                s.volume_pct = settings.volume_pct;
+                            }
+                        }
+                        // Mouse wheel over the rail or the % box: 2 % per notch like the Windows
+                        // volume flyout; touchpads scroll in points and adjust proportionally.
+                        if r.hovered() {
+                            let step = ui.input(|i| wheel_volume_step(&i.events));
+                            if step != 0.0 {
+                                settings.volume_pct =
+                                    (settings.volume_pct + step).clamp(0.0, 100.0);
+                                settings_changed = true;
+                                if snap.state == State::Streaming {
+                                    self.engine.send(Cmd::SetVolume(settings.volume_pct));
+                                }
+                            }
+                        }
+                    });
+
+                    ui.add_space(8.0);
+
+                    // 5. Large full-width Start/Stop button
+                    let (btn_label, btn_color) = if active {
+                        let col = if snap.state == State::Connecting {
+                            egui::Color32::from_rgb(0xd0, 0x8a, 0x20)
+                        } else {
+                            egui::Color32::from_rgb(0xb8, 0x38, 0x48)
+                        };
+                        (t(lang, Key::StopStreaming), col)
+                    } else {
+                        (
+                            t(lang, Key::StartStreaming),
+                            egui::Color32::from_rgb(0x32, 0x75, 0xd0),
+                        )
+                    };
+
+                    let btn = egui::Button::new(
+                        egui::RichText::new(btn_label)
+                            .size(16.0)
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(btn_color)
+                    .min_size(egui::vec2(ui.available_width(), 36.0));
+
+                    if ui.add(btn).clicked() {
+                        if active {
+                            self.engine.send(Cmd::Stop);
+                        } else if let Some(p) = self.start_params(&snap.devices, &settings) {
+                            self.engine.send(Cmd::Start(p));
                         }
                     }
-                });
 
-                ui.add_space(8.0);
-
-                // 5. Large full-width Start/Stop button
-                let (btn_label, btn_color) = if active {
-                    let col = if snap.state == State::Connecting {
-                        egui::Color32::from_rgb(0xd0, 0x8a, 0x20)
-                    } else {
-                        egui::Color32::from_rgb(0xb8, 0x38, 0x48)
-                    };
-                    (t(lang, Key::StopStreaming), col)
-                } else {
-                    (
-                        t(lang, Key::StartStreaming),
-                        egui::Color32::from_rgb(0x32, 0x75, 0xd0),
-                    )
-                };
-
-                let btn = egui::Button::new(
-                    egui::RichText::new(btn_label)
-                        .size(16.0)
-                        .strong()
-                        .color(egui::Color32::WHITE),
-                )
-                .fill(btn_color)
-                .min_size(egui::vec2(ui.available_width(), 36.0));
-
-                if ui.add(btn).clicked() {
-                    if active {
-                        self.engine.send(Cmd::Stop);
-                    } else if let Some(p) = self.start_params(&snap.devices, &settings) {
-                        self.engine.send(Cmd::Start(p));
-                    }
-                }
-
-                // 6. Compact stats caption that is collapsible
-                if snap.state == State::Streaming {
-                    if let Some(title) = &snap.track_title {
-                        ui.add_space(2.0);
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(format!("♪ {title}"))
-                                    .size(11.0)
-                                    .color(ui.visuals().weak_text_color()),
-                            )
-                            .truncate(),
-                        );
-                    }
-                    ui.add_space(6.0);
-                    let s = &snap.stats;
-                    let secs = s.since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-                    let columns = format_stats_columns(lang, secs, s.drift_ppm);
-                    let id = ui.make_persistent_id("stats_collapsing");
-                    egui::collapsing_header::CollapsingState::load_with_default_open(
-                        ui.ctx(),
-                        id,
-                        false,
-                    )
-                    .show_header(ui, |ui| spread_row(ui, &columns))
-                    .body(|ui| {
-                        let detail = format_stats_detail(
-                            lang,
-                            s.buffer_fill,
-                            s.packets_sent,
-                            s.retransmits,
-                            s.discontinuities,
-                            s.dropped,
-                        );
-                        egui::Grid::new("stats_detail")
-                            .num_columns(4)
-                            .spacing([12.0, 2.0])
-                            .show(ui, |ui| {
-                                for (i, (label, value)) in detail.iter().enumerate() {
-                                    ui.weak(*label);
-                                    ui.label(value);
-                                    if i % 2 == 1 {
-                                        ui.end_row();
+                    // 6. Compact stats caption that is collapsible
+                    if snap.state == State::Streaming {
+                        if let Some(title) = &snap.track_title {
+                            ui.add_space(2.0);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("♪ {title}"))
+                                        .size(11.0)
+                                        .color(ui.visuals().weak_text_color()),
+                                )
+                                .truncate(),
+                            );
+                        }
+                        ui.add_space(6.0);
+                        let s = &snap.stats;
+                        let secs = s.since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                        let columns = format_stats_columns(lang, secs, s.drift_ppm);
+                        let id = ui.make_persistent_id("stats_collapsing");
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            id,
+                            false,
+                        )
+                        .show_header(ui, |ui| spread_row(ui, &columns))
+                        .body(|ui| {
+                            let detail = format_stats_detail(
+                                lang,
+                                s.buffer_fill,
+                                s.packets_sent,
+                                s.retransmits,
+                                s.discontinuities,
+                                s.dropped,
+                            );
+                            egui::Grid::new("stats_detail")
+                                .num_columns(4)
+                                .spacing([12.0, 2.0])
+                                .show(ui, |ui| {
+                                    for (i, (label, value)) in detail.iter().enumerate() {
+                                        ui.weak(*label);
+                                        ui.label(value);
+                                        if i % 2 == 1 {
+                                            ui.end_row();
+                                        }
                                     }
-                                }
-                            });
-                    });
+                                });
+                        });
+                    }
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
@@ -789,6 +816,28 @@ fn spread_row(ui: &mut egui::Ui, texts: &[String]) {
     ui.spacing_mut().item_spacing.x = ((avail - used) / gaps).max(4.0);
     for s in texts {
         ui.label(egui::RichText::new(s).text_style(style.clone()));
+    }
+}
+
+/// A row showing a setting's current choice that expands, in place, into the list of
+/// choices (`list` returns whether one was picked, which folds the row again).
+fn choice_row(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    title: String,
+    list: impl FnOnce(&mut egui::Ui) -> bool,
+) {
+    let id = ui.make_persistent_id(id_salt);
+    let mut state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+    let header = egui::CollapsingHeader::new(title)
+        .id_salt(id_salt)
+        .open(Some(state.is_open()));
+    let response = header.show(ui, |ui| list(ui));
+    let picked = response.body_returned.unwrap_or(false);
+    if response.header_response.clicked() || picked {
+        state.set_open(!state.is_open() && !picked);
+        state.store(ui.ctx());
     }
 }
 
