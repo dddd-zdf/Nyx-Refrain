@@ -71,6 +71,13 @@ pub enum CaptureMode {
     Endpoint,
 }
 
+/// A default-output switch we made (see [`Settings::stream_output`]): endpoint IDs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwitchedOutput {
+    pub from: String,
+    pub to: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -91,6 +98,13 @@ pub struct Settings {
     /// Windows: the speakers are muted by us, not the user. Lets a later run unmute them when
     /// the app exited without doing so (logout, crash).
     pub local_muted: bool,
+    /// Windows: an output (endpoint ID) to make the default while streaming, switching back
+    /// when it stops. An output with no speakers keeps this PC silent with device loopback
+    /// capture, which then captures it. `None`: leave the default output alone.
+    pub stream_output: Option<String>,
+    /// Windows: the default-output switch we made, if any. Lets a later run switch back when
+    /// the app exited without doing so (logout, crash).
+    pub switched_output: Option<SwitchedOutput>,
     /// Reconnect to the saved device on launch if the app last exited while streaming.
     pub resume_on_launch: bool,
     /// Whether streaming was left on: set by Start, cleared only by an explicit Stop (quitting,
@@ -98,6 +112,8 @@ pub struct Settings {
     pub was_streaming: bool,
     /// Write the audio health log (see `audio_watch`), for tracing crackles.
     pub audio_log: bool,
+    /// Record the audio sent to the receiver (see `pipeline::sent_recorder`).
+    pub record_sent: bool,
 }
 
 impl Default for Settings {
@@ -114,9 +130,12 @@ impl Default for Settings {
             capture_mode: CaptureMode::Process,
             mute_local: true,
             local_muted: false,
+            stream_output: None,
+            switched_output: None,
             resume_on_launch: true,
             was_streaming: false,
             audio_log: false,
+            record_sent: false,
         }
     }
 }
@@ -169,9 +188,15 @@ mod tests {
             capture_mode: CaptureMode::Endpoint,
             mute_local: false,
             local_muted: true,
+            stream_output: Some("{0.0.0.00000000}.{acer}".into()),
+            switched_output: Some(SwitchedOutput {
+                from: "{0.0.0.00000000}.{lg}".into(),
+                to: "{0.0.0.00000000}.{acer}".into(),
+            }),
             resume_on_launch: false,
             was_streaming: true,
             audio_log: true,
+            record_sent: true,
         };
         let text = toml::to_string_pretty(&s).unwrap();
         assert!(text.contains("language = \"zh-CN\""));
@@ -190,9 +215,15 @@ mod tests {
         assert_eq!(back.capture_mode, CaptureMode::Endpoint);
         assert!(!back.mute_local);
         assert!(back.local_muted);
+        assert_eq!(
+            back.stream_output.as_deref(),
+            Some("{0.0.0.00000000}.{acer}")
+        );
+        assert_eq!(back.switched_output, s.switched_output);
         assert!(!back.resume_on_launch);
         assert!(back.was_streaming);
         assert!(back.audio_log);
+        assert!(back.record_sent);
 
         // Old gui.toml without language, send_now_playing or capture_mode must get the defaults
         let partial: Settings = toml::from_str("volume_pct = 10.0").unwrap();
@@ -204,9 +235,12 @@ mod tests {
         assert_eq!(partial.capture_mode, CaptureMode::Process);
         assert!(partial.mute_local);
         assert!(!partial.local_muted);
+        assert!(partial.stream_output.is_none());
+        assert!(partial.switched_output.is_none());
         assert!(partial.resume_on_launch);
         assert!(!partial.was_streaming);
         assert!(!partial.audio_log);
+        assert!(!partial.record_sent);
 
         // Explicit en
         let en: Settings = toml::from_str("language = \"en\"").unwrap();

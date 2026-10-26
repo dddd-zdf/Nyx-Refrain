@@ -66,13 +66,23 @@ pub enum Key {
     CaptureModeEndpointHint,
     MuteLocal,
     MuteLocalHint,
+    Diagnostics,
     AudioLog,
     AudioLogHint,
+    RecordSent,
+    RecordSentHint,
+    Settings,
+    Back,
+    StreamOutput,
+    StreamOutputHint,
+    StreamOutputOff,
+    StreamOutputMissing,
+    StreamOutputMissed,
 }
 
 impl Key {
     #[allow(dead_code)]
-    pub const ALL: [Key; 57] = [
+    pub const ALL: [Key; 67] = [
         Key::AppName,
         Key::StateIdle,
         Key::StateConnecting,
@@ -128,8 +138,18 @@ impl Key {
         Key::CaptureModeEndpointHint,
         Key::MuteLocal,
         Key::MuteLocalHint,
+        Key::Diagnostics,
         Key::AudioLog,
         Key::AudioLogHint,
+        Key::RecordSent,
+        Key::RecordSentHint,
+        Key::Settings,
+        Key::Back,
+        Key::StreamOutput,
+        Key::StreamOutputHint,
+        Key::StreamOutputOff,
+        Key::StreamOutputMissing,
+        Key::StreamOutputMissed,
     ];
 }
 
@@ -163,6 +183,10 @@ pub fn t(lang: Lang, key: Key) -> &'static str {
         (Lang::En, Key::TrayStop) => "Stop Streaming",
         (Lang::ZhCn, Key::TrayShow) => "显示窗口",
         (Lang::En, Key::TrayShow) => "Show Window",
+        (Lang::ZhCn, Key::Settings) => "设置",
+        (Lang::En, Key::Settings) => "Settings",
+        (Lang::ZhCn, Key::Back) => "返回",
+        (Lang::En, Key::Back) => "Back",
         (Lang::ZhCn, Key::TrayLanguage) => "语言",
         (Lang::En, Key::TrayLanguage) => "Language",
         (Lang::ZhCn, Key::TrayQuit) => "退出",
@@ -284,19 +308,45 @@ pub fn t(lang: Lang, key: Key) -> &'static str {
         }
         (Lang::ZhCn, Key::MuteLocal) => "推流时静音本机",
         (Lang::En, Key::MuteLocal) => "Mute this PC while streaming",
-        (Lang::ZhCn, Key::MuteLocalHint) => {
-            "避免本机和音箱一前一后同时出声，停止推流后恢复"
-        }
+        (Lang::ZhCn, Key::MuteLocalHint) => "避免本机和音箱一前一后同时出声，停止推流后恢复",
         (Lang::En, Key::MuteLocalHint) => {
             "So this PC and the speaker don't play out of sync; unmuted when streaming stops"
         }
-        (Lang::ZhCn, Key::AudioLog) => "音频日志（调试）",
-        (Lang::En, Key::AudioLog) => "Audio log (debug)",
+        (Lang::ZhCn, Key::Diagnostics) => "诊断",
+        (Lang::En, Key::Diagnostics) => "Diagnostics",
+        (Lang::ZhCn, Key::AudioLog) => "音频日志",
+        (Lang::En, Key::AudioLog) => "Audio log",
+        (Lang::ZhCn, Key::RecordSent) => "录制发送的音频",
+        (Lang::En, Key::RecordSent) => "Record sent audio",
+        (Lang::ZhCn, Key::RecordSentHint) => {
+            "每次推流把发出的音频写到 %TEMP%\\nyx-refrain-sent-*.wav（每小时约 635 MB），用于查爆音出在网络前还是网络后"
+        }
+        (Lang::En, Key::RecordSentHint) => {
+            "Writes the audio sent each stream to %TEMP%\\nyx-refrain-sent-*.wav (about 635 MB an hour), to tell whether a crackle comes before or after the network"
+        }
         (Lang::ZhCn, Key::AudioLogHint) => {
             "推流时每秒写一行到 %TEMP%\\nyx-refrain-audio.log，用于排查爆音"
         }
         (Lang::En, Key::AudioLogHint) => {
             "While streaming, writes one line a second to %TEMP%\\nyx-refrain-audio.log, for tracing crackles"
+        }
+        (Lang::ZhCn, Key::StreamOutput) => "推流时输出到",
+        (Lang::En, Key::StreamOutput) => "While streaming, play through",
+        (Lang::ZhCn, Key::StreamOutputHint) => {
+            "推流时把它设为默认输出设备，停止后切回。选一个不出声的设备（没有扬声器的显示器、VB-CABLE），本机就保持安静"
+        }
+        (Lang::En, Key::StreamOutputHint) => {
+            "Makes this the default output while streaming and switches back when it stops. Pick one with no speakers (a monitor without speakers, VB-CABLE) to keep this PC silent"
+        }
+        (Lang::ZhCn, Key::StreamOutputOff) => "不切换",
+        (Lang::En, Key::StreamOutputOff) => "Don't switch",
+        (Lang::ZhCn, Key::StreamOutputMissing) => "（未连接）",
+        (Lang::En, Key::StreamOutputMissing) => "(not connected)",
+        (Lang::ZhCn, Key::StreamOutputMissed) => {
+            "无法切换到所选输出设备（未连接？），正在使用当前输出推流"
+        }
+        (Lang::En, Key::StreamOutputMissed) => {
+            "Couldn't switch to the chosen output (not connected?); streaming from the current one"
         }
     }
 }

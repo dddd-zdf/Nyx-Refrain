@@ -1,5 +1,6 @@
 //! Optional recording of the exact audio sent to the receiver, for telling crackles made
-//! before the network from ones made after it. Set `NYX_RECORD_SENT=1` to write one
+//! before the network from ones made after it. Set `NYX_RECORD_SENT=1` (or [`ENABLED`],
+//! the app's setting) to write one
 //! `%TEMP%\nyx-refrain-sent-<ms>.wav` per stream (`/tmp` on Linux), 44.1 kHz 16-bit stereo,
 //! plus a `.txt` of the same name holding the Unix time of its first sample (a restarted
 //! stream gets new files). Packets are sent in real time, so a position in the file maps
@@ -16,6 +17,9 @@ use crate::resample::TARGET_SAMPLE_RATE;
 
 const MAX_SECONDS: u64 = 3600;
 
+/// Record streams started from now on, as `NYX_RECORD_SENT` does.
+pub static ENABLED: AtomicBool = AtomicBool::new(false);
+
 /// Hands packets from the sender thread to a writer thread; never blocks the sender.
 pub struct SentRecorder {
     producer: rtrb::Producer<[i16; ALAC_PCM_SAMPLES]>,
@@ -23,9 +27,12 @@ pub struct SentRecorder {
 }
 
 impl SentRecorder {
-    /// A recorder if `NYX_RECORD_SENT` is set and the file could be created.
+    /// A recorder if `NYX_RECORD_SENT` or [`ENABLED`] is set and the file could be created.
     pub fn from_env() -> Option<Self> {
-        std::env::var_os("NYX_RECORD_SENT").filter(|v| !v.is_empty() && v != "0")?;
+        let env = std::env::var_os("NYX_RECORD_SENT").is_some_and(|v| !v.is_empty() && v != "0");
+        if !env && !ENABLED.load(Ordering::Relaxed) {
+            return None;
+        }
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
