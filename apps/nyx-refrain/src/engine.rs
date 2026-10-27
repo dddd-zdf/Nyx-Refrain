@@ -375,9 +375,10 @@ type OutputSwitch = ();
 struct StreamOutput {
     #[cfg_attr(not(windows), allow(dead_code))]
     guard: Option<OutputSwitch>,
-    /// (ours, the output it replaced) when stopping found another output the default (a
-    /// headset turned on): if that output's app later switches to ours, we switch back.
-    handed_off: Option<(String, String)>,
+    /// (ours, the output it replaced, the default then) when stopping found another output
+    /// the default (a headset turned on): if that output is later unplugged and Windows or
+    /// its app falls back to ours, we switch back once. See [`OutputSwitch::hand_back`].
+    handed_off: Option<(String, String, String)>,
 }
 
 /// Makes `want` (an endpoint ID) the default output, or switches back to the output it
@@ -406,8 +407,10 @@ fn set_stream_output(
             switch.handed_off = None;
         }
         if let Some(g) = switch.guard.take_if(|g| want != Some(g.target_id())) {
-            if !g.is_current() {
-                switch.handed_off = Some((g.target_id().into(), g.previous_id().into()));
+            if !g.is_current()
+                && let Some(default) = OutputSwitch::current_default()
+            {
+                switch.handed_off = Some((g.target_id().into(), g.previous_id().into(), default));
             }
             drop(g);
         }
@@ -477,8 +480,8 @@ fn output_switch_lost(
 /// Not streaming: see [`StreamOutput::handed_off`].
 fn hand_back_output(switch: &mut StreamOutput) {
     #[cfg(windows)]
-    if let Some((ours, theirs)) = &switch.handed_off {
-        match OutputSwitch::hand_back(ours, theirs) {
+    if let Some((ours, theirs, stopped_on)) = &switch.handed_off {
+        match OutputSwitch::hand_back(ours, theirs, stopped_on) {
             Ok(true) => switch.handed_off = None,
             Ok(false) => {}
             Err(e) => {
