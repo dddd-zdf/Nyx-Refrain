@@ -66,11 +66,13 @@ pub enum Key {
     CaptureModeEndpointHint,
     MuteLocal,
     MuteLocalHint,
+    Settings,
+    Back,
 }
 
 impl Key {
     #[allow(dead_code)]
-    pub const ALL: [Key; 55] = [
+    pub const ALL: [Key; 57] = [
         Key::AppName,
         Key::StateIdle,
         Key::StateConnecting,
@@ -126,6 +128,8 @@ impl Key {
         Key::CaptureModeEndpointHint,
         Key::MuteLocal,
         Key::MuteLocalHint,
+        Key::Settings,
+        Key::Back,
     ];
 }
 
@@ -159,6 +163,10 @@ pub fn t(lang: Lang, key: Key) -> &'static str {
         (Lang::En, Key::TrayStop) => "Stop Streaming",
         (Lang::ZhCn, Key::TrayShow) => "显示窗口",
         (Lang::En, Key::TrayShow) => "Show Window",
+        (Lang::ZhCn, Key::Settings) => "设置",
+        (Lang::En, Key::Settings) => "Settings",
+        (Lang::ZhCn, Key::Back) => "返回",
+        (Lang::En, Key::Back) => "Back",
         (Lang::ZhCn, Key::TrayLanguage) => "语言",
         (Lang::En, Key::TrayLanguage) => "Language",
         (Lang::ZhCn, Key::TrayQuit) => "退出",
