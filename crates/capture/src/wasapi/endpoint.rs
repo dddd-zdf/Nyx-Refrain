@@ -294,13 +294,29 @@ impl DefaultOutputGuard {
         is_active(&self.target_id).unwrap_or(true)
     }
 
-    /// After a guard was dropped while another output was the default: switches from
-    /// `target_id` back to `previous_id` if something made `target_id` the default again (a
-    /// headset app returning to the output it replaced). Returns whether it switched.
-    pub fn hand_back(target_id: &str, previous_id: &str) -> windows::core::Result<bool> {
+    /// The default output's endpoint ID, if Windows can say.
+    pub fn current_default() -> Option<String> {
+        let _com = super::ComMtaGuard::new().ok()?;
+        get_device_id(&get_default_render_device().ok()?).ok()
+    }
+
+    /// After a guard was dropped while `stopped_on_id` (a headset) was the default, instead of
+    /// `target_id`. Once that output is unplugged and Windows (or its app) falls back to
+    /// `target_id`, switches back to `previous_id`, the output `target_id` replaced. Returns
+    /// whether to stop watching: switched back, or the user moved on (picked another output,
+    /// or picked `target_id` by hand while the headset is still connected).
+    pub fn hand_back(
+        target_id: &str,
+        previous_id: &str,
+        stopped_on_id: &str,
+    ) -> windows::core::Result<bool> {
         let _com = super::ComMtaGuard::new()?;
-        if !is_default(target_id)? || !is_active(previous_id)? {
+        let default = get_device_id(&get_default_render_device()?)?;
+        if default == stopped_on_id {
             return Ok(false);
+        }
+        if default != target_id || is_active(stopped_on_id)? || !is_active(previous_id)? {
+            return Ok(true);
         }
         set_default_render_device(previous_id)?;
         info!(from = %target_id, to = %previous_id, "Switched the default output back");
